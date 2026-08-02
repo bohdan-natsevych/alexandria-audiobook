@@ -48,7 +48,7 @@ class JobOnlyRouteTests(unittest.TestCase):
         allowed_exact = {
             "/", "/favicon.ico", "/static", "/openapi.json", "/docs",
             "/docs/oauth2-redirect", "/redoc", "/api/config",
-            "/api/default_prompts", "/api/system/stats", "/api/lora/models",
+            "/api/default_prompts", "/api/system/stats", "/api/features", "/api/lora/models",
             "/api/lora/models/{adapter_id}", "/api/lora/download/{adapter_id}",
         }
         paths = {route.path for route in server.app.routes}

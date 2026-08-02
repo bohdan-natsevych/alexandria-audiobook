@@ -172,6 +172,11 @@ async def get_system_stats():
         }
     }
 
+@app.get("/api/features")
+async def get_features():
+    """Report optional server capabilities without exposing server-owned project state."""
+    return {"preparer": os.path.isfile(PREPARER_SCRIPT_PATH)}
+
 # Data Models
 class LLMConfig(BaseModel):
     base_url: str
@@ -595,7 +600,12 @@ async def create_tts_batch_job(
 
 
 @app.post("/api/jobs/script-generate")
-async def create_script_generation_job(source_file: UploadFile = File(...)):
+async def create_script_generation_job(
+    source_file: UploadFile = File(...),
+    single_speaker: bool = Form(False),
+    speaker_name: str = Form("Narrator"),
+    instruct: str = Form("Neutral narration."),
+):
     """Run the existing annotation pipeline against a job-local source file.
 
     The subprocess runs entirely inside the disposable job workspace.
@@ -618,6 +628,12 @@ async def create_script_generation_job(source_file: UploadFile = File(...)):
             input_path = text_path
         context.set_progress(0, 1, "Generating annotated script")
         command = [sys.executable, "-u", os.path.join(BASE_DIR, "generate_script.py"), str(input_path)]
+        if single_speaker:
+            command.extend([
+                "--single-speaker",
+                "--speaker-name", speaker_name.strip() or "Narrator",
+                "--instruct", instruct.strip() or "Neutral narration.",
+            ])
         context.log(f"Starting script generation for {filename}")
         returncode = context.run_subprocess(command, context.work_dir)
         if context.cancelled():
