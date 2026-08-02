@@ -6,16 +6,11 @@ services:
     volumes:
       # Persist HuggingFace model cache (~3.5 GB per model, downloaded on first use)
       - hf_cache:/root/.cache/huggingface
-      # Persist user data
-      - ./data/uploads:/alexandria/app/uploads
-      - ./data/designed_voices:/alexandria/designed_voices
-      - ./data/clone_voices:/alexandria/clone_voices
+      # Persist server configuration and reusable compute assets only.
+      # Project state and audio remain in each browser's IndexedDB.
+      - ./data/config:/alexandria/config
       - ./data/lora_models:/alexandria/lora_models
-      - ./data/lora_datasets:/alexandria/lora_datasets
-      - ./data/dataset_builder:/alexandria/dataset_builder
-      - ./data/scripts:/alexandria/scripts
-      # Persist audiobook output
-      - ./data/output:/alexandria/voicelines
+      - ./data/builtin_lora:/alexandria/builtin_lora
     deploy:
       resources:
         reservations:

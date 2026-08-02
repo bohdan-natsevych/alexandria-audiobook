@@ -4,6 +4,25 @@ import time
 import tempfile
 
 
+def build_llm_extra_body(base_url, top_k=0, min_p=0, banned_tokens=None):
+    """Build OpenAI-compatible extra_body sampling fields.
+
+    CURSOR: Gemini's OpenAI-compat endpoint rejects top_k/min_p/banned_tokens
+    even when zero; omit them for Google URLs. Other local servers may use them.
+    """
+    url = str(base_url or "").lower()
+    if "generativelanguage.googleapis.com" in url or "/gemini" in url:
+        return {}
+    body = {}
+    if top_k:
+        body["top_k"] = top_k
+    if min_p:
+        body["min_p"] = min_p
+    if banned_tokens:
+        body["banned_tokens"] = banned_tokens
+    return body
+
+
 def atomic_json_write(data, target_path, max_retries=5):
     """Atomically write JSON data using a temp file and os.replace.
 

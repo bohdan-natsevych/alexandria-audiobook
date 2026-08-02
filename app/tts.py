@@ -86,11 +86,14 @@ def compute_timeline(chunks_with_audio, pause_ms=DEFAULT_PAUSE_MS,
 
 
 class TTSEngine:
-    """TTS engine supporting local (qwen-tts) and external (Gradio) backends.
+    """TTS engine supporting local (qwen-tts / ESpeech) and external (Gradio) backends.
 
     Mode is determined by config["tts"]["mode"]:
       - "local": Loads Qwen3TTSModel directly. No external server needed.
       - "external": Connects via Gradio client to a running TTS server.
+
+    When language is Russian, clone voices prefer local ESpeech; other voice
+    types still use Qwen (local or external per mode).
 
     Models and clients are lazily initialized on first use.
     """
@@ -121,14 +124,47 @@ class TTSEngine:
         self._lora_adapter_path = None  # track which adapter is currently loaded
         self._gradio_client = None
 
-        # Clone prompt cache: speaker_name -> (ref_audio_path, reusable voice_clone_prompt)
+        # Clone prompt cache: speaker_name ->
+        # (ref_audio_path, ref_text, audio_mtime_ns, audio_size, reusable prompt)
+        # The transcript is part of a clone prompt. It is not merely display
+        # metadata, so changing it must invalidate the prompt too.
         self._clone_prompt_cache = {}
         # LoRA clone prompt cache: adapter_path -> reusable voice_clone_prompt
         self._lora_prompt_cache = {}
 
+        # CURSOR: ESpeech used for Russian clone voices; lazy-loaded on first use
+        self._espeech_engine = None
+
     @property
     def mode(self):
         return self._mode
+
+    def _is_russian_tts(self):
+        return str(self._language or "").strip().lower() == "russian"
+
+    def _prefer_espeech_clone(self):
+        """Russian audiobooks prefer local ESpeech for clone voices."""
+        return self._is_russian_tts()
+
+    def _get_espeech(self):
+        if self._espeech_engine is None:
+            from espeech_tts import ESpeechEngine
+            self._espeech_engine = ESpeechEngine(device=self._device)
+        return self._espeech_engine
+
+    def _resolve_clone_refs(self, speaker, voice_config):
+        """Return absolute (ref_audio_path, ref_text) for a clone speaker."""
+        voice_data = voice_config.get(speaker, {})
+        ref_audio_path = voice_data.get("ref_audio")
+        ref_text = voice_data.get("ref_text")
+        if not ref_audio_path or not ref_text:
+            raise ValueError(f"Clone voice for '{speaker}' missing ref_audio or ref_text")
+        if not os.path.isabs(ref_audio_path):
+            root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            ref_audio_path = os.path.join(root_dir, ref_audio_path)
+        if not os.path.exists(ref_audio_path):
+            raise FileNotFoundError(f"Reference audio not found for '{speaker}': {ref_audio_path}")
+        return ref_audio_path, ref_text
 
     @staticmethod
     def _concat_audio(wav):
@@ -642,25 +678,26 @@ class TTSEngine:
 
     def _get_clone_prompt(self, speaker, voice_config):
         """Get or create a cached voice clone prompt for a speaker."""
-        voice_data = voice_config.get(speaker, {})
-        ref_audio_path = voice_data.get("ref_audio")
-        ref_text = voice_data.get("ref_text")
+        ref_audio_path, ref_text = self._resolve_clone_refs(speaker, voice_config)
 
-        if not ref_audio_path or not ref_text:
-            raise ValueError(f"Clone voice for '{speaker}' missing ref_audio or ref_text")
-        # Resolve relative paths against project root (parent of app/)
-        if not os.path.isabs(ref_audio_path):
-            root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            ref_audio_path = os.path.join(root_dir, ref_audio_path)
-        if not os.path.exists(ref_audio_path):
-            raise FileNotFoundError(f"Reference audio not found for '{speaker}': {ref_audio_path}")
+        # The reference transcript and the source file contents both affect
+        # the prompt. Include the latter's stat signature so re-uploading or
+        # replacing a file at the same path cannot keep an old prompt alive.
+        audio_stat = os.stat(ref_audio_path)
+        cache_key = (
+            ref_audio_path,
+            ref_text,
+            audio_stat.st_mtime_ns,
+            audio_stat.st_size,
+        )
 
-        # Check cache — invalidate if ref_audio changed
+        # Check cache — invalidate when any part of the clone reference changes.
         if speaker in self._clone_prompt_cache:
-            cached_path, cached_prompt = self._clone_prompt_cache[speaker]
-            if cached_path == ref_audio_path:
+            cached_path, cached_text, cached_mtime_ns, cached_size, cached_prompt = \
+                self._clone_prompt_cache[speaker]
+            if (cached_path, cached_text, cached_mtime_ns, cached_size) == cache_key:
                 return cached_prompt
-            print(f"Voice changed for '{speaker}', rebuilding clone prompt...")
+            print(f"Clone reference changed for '{speaker}', rebuilding clone prompt...")
 
         model = self._init_local_clone()
 
@@ -675,7 +712,7 @@ class TTSEngine:
             ref_audio=(audio_array, sample_rate),
             ref_text=ref_text,
         )
-        self._clone_prompt_cache[speaker] = (ref_audio_path, prompt)
+        self._clone_prompt_cache[speaker] = (*cache_key, prompt)
         print(f"Clone prompt cached for '{speaker}'.")
         return prompt
 
@@ -690,10 +727,47 @@ class TTSEngine:
 
     def generate_clone_voice(self, text, speaker, voice_config, output_path):
         """Generate audio using voice cloning. Returns True on success."""
+        # CURSOR: Prefer ESpeech for Russian clones; fall back to Qwen otherwise
+        if self._prefer_espeech_clone():
+            return self._espeech_generate_clone(text, speaker, voice_config, output_path)
         if self._mode == "local":
             return self._local_generate_clone(text, speaker, voice_config, output_path)
         else:
             return self._external_generate_clone(text, speaker, voice_config, output_path)
+
+    def _espeech_generate_clone(self, text, speaker, voice_config, output_path):
+        """Generate clone audio via local ESpeech (Russian)."""
+        try:
+            import time
+
+            voice_data = voice_config.get(speaker) or {}
+            seed = int(voice_data.get("seed", -1))
+            ref_audio_path, ref_text = self._resolve_clone_refs(speaker, voice_config)
+
+            print(
+                f"TTS [ESpeech] generating for speaker='{speaker}', "
+                f"text='{text[:50]}...'"
+            )
+            engine = self._get_espeech()
+            t_start = time.time()
+            ok = engine.synthesize(
+                text=text,
+                ref_audio_path=ref_audio_path,
+                ref_text=ref_text,
+                output_path=output_path,
+                seed=seed,
+            )
+            gen_time = time.time() - t_start
+            if not ok:
+                print(f"Error: ESpeech returned no audio for: '{text[:50]}...'")
+                return False
+            print(f"TTS [ESpeech] done in {gen_time:.1f}s -> {output_path}")
+            return True
+        except Exception as e:
+            import traceback
+            print(f"Error generating ESpeech clone for '{speaker}': {e}")
+            traceback.print_exc()
+            return False
 
     def generate_voice(self, text, instruct_text, speaker, voice_config, output_path):
         """Generate audio using the appropriate method based on voice type config."""
@@ -972,7 +1046,9 @@ class TTSEngine:
 
         # Process clone voice chunks (batched by speaker in local mode)
         if clone_chunks:
-            if self._mode == "local":
+            if self._prefer_espeech_clone():
+                batch_results = self._espeech_batch_clone(clone_chunks, voice_config, output_dir)
+            elif self._mode == "local":
                 batch_results = self._local_batch_clone(clone_chunks, voice_config, output_dir)
             else:
                 batch_results = {"completed": [], "failed": []}
@@ -1286,6 +1362,26 @@ class TTSEngine:
 
 
 
+        return results
+
+    def _espeech_batch_clone(self, chunks, voice_config, output_dir):
+        """Sequential ESpeech clone generation (F5-TTS has no Qwen-style batch API)."""
+        results = {"completed": [], "failed": []}
+        print(f"Batch [ESpeech]: generating {len(chunks)} clone chunks...")
+        for chunk in chunks:
+            idx = chunk["index"]
+            output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
+            try:
+                success = self._espeech_generate_clone(
+                    chunk["text"], chunk["speaker"], voice_config, output_path
+                )
+                if success:
+                    results["completed"].append(idx)
+                else:
+                    results["failed"].append((idx, "ESpeech clone generation failed"))
+            except Exception as e:
+                results["failed"].append((idx, str(e)))
+            self._clear_gpu_cache()
         return results
 
     def _local_batch_clone(self, chunks, voice_config, output_dir):

@@ -10,24 +10,22 @@ RUN apt-get update && \
 # Install Python dependencies
 COPY app/requirements.txt /alexandria/app/requirements.txt
 RUN pip install --no-cache-dir -r app/requirements.txt && \
-    pip install --no-cache-dir qwen-tts==0.1.1
+    pip install --no-cache-dir qwen-tts==0.1.1 && \
+    pip install --no-cache-dir f5-tts ruaccent
 
 # Copy application code
 COPY app/ /alexandria/app/
-COPY default_prompts.txt review_prompts.txt /alexandria/
+COPY default_prompts.txt review_prompts.txt persona_prompts.txt /alexandria/
 COPY builtin_lora/ /alexandria/builtin_lora/
 
-# Create directories for runtime data
-RUN mkdir -p /alexandria/scripts \
-    /alexandria/designed_voices \
-    /alexandria/clone_voices \
-    /alexandria/lora_models \
-    /alexandria/lora_datasets \
-    /alexandria/dataset_builder \
-    /alexandria/app/uploads
+# Only reusable compute assets and disposable jobs live on the server.
+RUN mkdir -p /alexandria/lora_models \
+    /alexandria/job_workspaces \
+    /alexandria/config
 
 # Bind to 0.0.0.0 inside the container
 ENV ALEXANDRIA_HOST=0.0.0.0
+ENV ALEXANDRIA_CONFIG_PATH=/alexandria/config/config.json
 EXPOSE 4200
 
 CMD ["python", "app/app.py"]

@@ -633,12 +633,13 @@ def main():
     parser.add_argument("--batch-size", type=int, default=40, help="Script entries per advanced discovery batch")
     parser.add_argument("--speakers", default="", help="Optional comma-separated speaker allowlist")
     parser.add_argument("--narration-window", type=int, default=4, help="How many preceding narrator lines to include as intro context")
+    parser.add_argument("--root", help="Project root containing script/config/output directories")
     args = parser.parse_args()
 
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root = os.path.abspath(args.root) if args.root else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     script_path = os.path.join(root, "annotated_script.json")
     voice_config_path = os.path.join(root, "voice_config.json")
-    app_config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    app_config_path = os.environ.get("ALEXANDRIA_CONFIG_PATH", os.path.join(os.path.dirname(__file__), "config.json"))
 
     if not os.path.exists(script_path):
         print(f"Error: {script_path} not found. Generate script first.")

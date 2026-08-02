@@ -1,3 +1,4 @@
+
 <img width="475" height="467" alt="Alexandria Logo" src="https://github.com/user-attachments/assets/fa2c36d3-a5f3-49ab-9dfe-30933359dfbd" />
 
 # Alexandria Audiobook Generator
@@ -87,6 +88,9 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 
 ## Installation
 
+For a GPU compute server on one machine and the UI on another, follow the
+[separate server/UI deployment guide](README_CLIENT_SERVER.md).
+
 ### Option A: Pinokio (Recommended)
 
 1. Install [Pinokio](https://pinokio.computer/) if you haven't already
@@ -113,7 +117,7 @@ cd alexandria-audiobook
 docker compose up --build
 ```
 
-Requires [Docker](https://docs.docker.com/get-docker/) with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html). The web UI is available at `http://localhost:4200`. TTS models download on first use and are cached in a Docker volume. User data (uploads, voice configs, trained LoRA adapters, audio output) persists via bind mounts to the project directory.
+Requires [Docker](https://docs.docker.com/get-docker/) with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html). The web UI is available at `http://localhost:4200`. TTS models download on first use and are cached in a Docker volume. Browser-owned project state and audio stay on the client. Server configuration and reusable LoRA adapters persist under `data/`.
 
 ## First Launch — What to Expect
 
@@ -248,6 +252,7 @@ Configure connections to your LLM and TTS engine.
 ### Script Tab
 Upload a text file (.txt, .md, or .epub) and generate the annotated script. EPUB files are automatically converted to plain text on upload. The LLM converts your book into a structured JSON format with:
 - Speaker identification (NARRATOR vs character names)
+
 - Dialogue text with natural vocalizations (written as pronounceable text, not tags)
 - Style directions for TTS delivery
 
@@ -446,23 +451,13 @@ Vocalizations are written as real pronounceable text that the TTS speaks directl
 
 ## Output Files
 
-**Final Audiobook:**
-- `cloned_audiobook.mp3` - Combined audiobook with natural pauses
+Generated chunk WAVs live in the browser's IndexedDB. Export jobs upload them
+temporarily and trigger a browser download; they do not create permanent
+server-side audiobook files.
 
-**Individual Voicelines (for DAW editing):**
-```
-voicelines/
-├── voiceline_0001_narrator.mp3
-├── voiceline_0002_elena.mp3
-├── voiceline_0003_marcus.mp3
-└── ...
-```
+**Final Audiobook:** `audiobook.mp3`, downloaded after Merge All.
 
-Files are numbered in timeline order with speaker names for easy:
-- Import into Audacity or other DAWs
-- Placement on separate character tracks
-- Fine-tuning of timing and effects
-
+ **Audacity Export (per-speaker tracks):
 **Audacity Export (per-speaker tracks):**
 ```
 audacity_export.zip
@@ -477,351 +472,64 @@ audacity_export.zip
 Each WAV track is padded to the same total duration with silence where other speakers are talking. Playing all tracks simultaneously sounds identical to the merged MP3.
 
 **M4B Audiobook (chaptered):**
-- `audiobook.m4b` - AAC audiobook with embedded chapter markers
+- `audiobook.m4b` - downloaded AAC audiobook with embedded chapter markers
 - Chapters auto-detected from script headings, or per-chunk when toggled
 - Compatible with Audiobookshelf, Apple Books, VLC, Haruna, and most audiobook players
 
-## API Reference
 
-Alexandria exposes a REST API for programmatic access:
+## Client/Server Architecture
 
-### Configuration
+The browser is the project owner. Script JSON, chunk edits, voice configuration, clone references, designed-voice previews, training-dataset ZIPs, and generated audiobook chunks are stored in IndexedDB. Ask the browser for persistent storage when prompted and avoid clearing site data while a project is active.
+
+The compute server has no current-project directory and exposes no project CRUD endpoints. Every heavy operation is an isolated job:
+
+- script generation and review;
+- persona generation;
+- single and batch TTS;
+- voice design and dataset generation;
+- LoRA training;
+- voice-dataset preparation with faster-whisper;
+- MP3, M4B, and Audacity export.
+
+Job inputs are copied to a UUID workspace, results are downloaded by the browser, and the workspace expires after 24 hours by default. Server configuration, downloaded models, and reusable trained LoRA adapters remain server-side compute assets.
+
+### Running UI and Compute on Separate Machines
+
+1. On the GPU server, run `docker compose up --build` and allow TCP port 4200 through the LAN firewall.
+2. On the client machine, either open `http://SERVER_IP:4200`, or serve `app/static/index.html` with any static web server.
+3. For a separately hosted UI, open it once with `?apiBase=http://SERVER_IP:4200`. The browser remembers that URL in local storage.
+4. Do not open the HTML through a `file://` URL; IndexedDB behavior is unreliable there. Serve it over HTTP.
+5. This prototype intentionally has open CORS and no authentication. Do not expose it directly to the public internet.
+
+Example client-only static server:
+
 ```bash
-# Get current config (empty prompts fall through to file defaults)
-curl http://127.0.0.1:4200/api/config
-
-# Get file-based default prompts (hot-reloads from default_prompts.txt)
-curl http://127.0.0.1:4200/api/default_prompts
-
-# Save config
-curl -X POST http://127.0.0.1:4200/api/config \
-  -H "Content-Type: application/json" \
-  -d '{
-    "llm": {"base_url": "...", "api_key": "...", "model_name": "..."},
-    "tts": {
-      "mode": "local",
-      "device": "auto",
-      "language": "English",
-      "parallel_workers": 25,
-      "batch_seed": 12345,
-      "compile_codec": true,
-      "sub_batch_enabled": true,
-      "sub_batch_min_size": 4,
-      "sub_batch_ratio": 5,
-      "pause_between_speakers_ms": 500,
-      "pause_same_speaker_ms": 250
-    }
-  }'
+cd app/static
+python -m http.server 8080
+# Open http://CLIENT_IP:8080/?apiBase=http://SERVER_IP:4200
 ```
 
-### Script Generation
-```bash
-# Upload text file (supports .txt, .md, .epub)
-curl -X POST http://127.0.0.1:4200/api/upload \
-  -F "file=@mybook.epub"
+### Job API
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/jobs/script-generate` | Upload TXT, Markdown, or EPUB and produce client project JSON |
+| POST | `/api/jobs/script-review` | Review client-supplied script JSON |
+| POST | `/api/jobs/personas-generate` | Return voice config and reference-audio artifacts |
+| POST | `/api/jobs/tts-chunk` | Return one generated WAV |
+| POST | `/api/jobs/tts-batch` | Return generated WAV artifacts and a ZIP |
+| POST | `/api/jobs/voice-design` | Return a designed-voice WAV |
+| POST | `/api/jobs/dataset-builder` | Return dataset WAV artifacts and training ZIP |
+| POST | `/api/jobs/lora-train` | Train and register a reusable server adapter |
+| POST | `/api/jobs/preparer` | Transcribe owned audio and return a training ZIP |
+| POST | `/api/jobs/export` | Temporarily upload client chunks and return MP3, M4B, or Audacity ZIP |
+| GET | `/api/jobs/{id}` | Job state, progress, artifacts, and result URL |
+| GET | `/api/jobs/{id}/logs` | Structured job logs |
+| POST | `/api/jobs/{id}/cancel` | Request cancellation |
+| DELETE | `/api/jobs/{id}` | Delete a completed job immediately |
+
+The only non-job API routes are shared server configuration, system statistics, prompt defaults, and reusable LoRA adapter list/download/delete operations. There are no compatibility endpoints for server-side chunks, scripts, voices, datasets, or exports.
 
-# Generate script (returns task ID)
-curl -X POST http://127.0.0.1:4200/api/generate_script
-
-# Check status
-curl http://127.0.0.1:4200/api/status/script_generation
-
-# Review script (fix attribution tags, misattributed lines, etc.)
-curl -X POST http://127.0.0.1:4200/api/review_script
-
-# Check review status
-curl http://127.0.0.1:4200/api/status/review
-```
-
-### Voice Management
-```bash
-# Get voices and config
-curl http://127.0.0.1:4200/api/voices
-
-# Parse voices from script
-curl -X POST http://127.0.0.1:4200/api/parse_voices
-
-# Save voice config
-curl -X POST http://127.0.0.1:4200/api/save_voice_config \
-  -H "Content-Type: application/json" \
-  -d '{"NARRATOR": {"type": "custom", "voice": "Ryan", "character_style": "calm"}}'
-```
-
-### Chunk Management
-```bash
-# Get all chunks
-curl http://127.0.0.1:4200/api/chunks
-
-# Update a chunk
-curl -X POST http://127.0.0.1:4200/api/chunks/5 \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Updated dialogue", "instruct": "Excited, bright energy."}'
-
-# Generate audio for single chunk
-curl -X POST http://127.0.0.1:4200/api/chunks/5/generate
-
-# Standard batch render (parallel individual calls)
-curl -X POST http://127.0.0.1:4200/api/generate_batch \
-  -H "Content-Type: application/json" \
-  -d '{"indices": [0, 1, 2, 3, 4]}'
-
-# Fast batch render (batched TTS calls, much faster)
-curl -X POST http://127.0.0.1:4200/api/generate_batch_fast \
-  -H "Content-Type: application/json" \
-  -d '{"indices": [0, 1, 2, 3, 4]}'
-
-# Merge all chunks into final audiobook
-curl -X POST http://127.0.0.1:4200/api/merge
-```
-
-### Saved Scripts
-```bash
-# List saved scripts
-curl http://127.0.0.1:4200/api/scripts
-
-# Save current script
-curl -X POST http://127.0.0.1:4200/api/scripts/save \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my-novel"}'
-
-# Load a saved script
-curl -X POST http://127.0.0.1:4200/api/scripts/load \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my-novel"}'
-```
-
-### Persona Generation
-```bash
-# Generate personas (LLM + VoiceDesign, assigns clone voices automatically)
-curl -X POST http://127.0.0.1:4200/api/generate_personas
-
-# Generate personas in advanced mode with custom batch size
-curl -X POST http://127.0.0.1:4200/api/generate_personas \
-  -H "Content-Type: application/json" \
-  -d '{"advanced": true, "batch_size": 40}'
-
-# Check persona generation status
-curl http://127.0.0.1:4200/api/status/persona
-
-# Cancel persona generation
-curl -X POST http://127.0.0.1:4200/api/cancel_persona
-```
-
-### Voice Designer
-```bash
-# Preview a voice from text description
-curl -X POST http://127.0.0.1:4200/api/voice_design/preview \
-  -H "Content-Type: application/json" \
-  -d '{"description": "A warm, deep male voice", "text": "Hello world."}'
-
-# Save a designed voice
-curl -X POST http://127.0.0.1:4200/api/voice_design/save \
-  -H "Content-Type: application/json" \
-  -d '{"name": "warm_narrator", "description": "A warm, deep male voice", "text": "Hello world."}'
-
-# List saved designed voices
-curl http://127.0.0.1:4200/api/voice_design/list
-
-# Delete a designed voice
-curl -X DELETE http://127.0.0.1:4200/api/voice_design/delete/voice_id_here
-```
-
-### LoRA Training
-```bash
-# Upload a training dataset (ZIP with WAV + metadata.jsonl)
-curl -X POST http://127.0.0.1:4200/api/lora/upload_dataset \
-  -F "file=@dataset.zip" -F "name=my_voice"
-
-# Generate a dataset from Voice Designer description
-curl -X POST http://127.0.0.1:4200/api/lora/generate_dataset \
-  -H "Content-Type: application/json" \
-  -d '{"name": "warm_voice", "description": "A warm male voice", "texts": ["Hello.", "Goodbye."]}'
-
-# List uploaded datasets
-curl http://127.0.0.1:4200/api/lora/datasets
-
-# Delete a dataset
-curl -X DELETE http://127.0.0.1:4200/api/lora/datasets/dataset_id_here
-
-# Start LoRA training
-curl -X POST http://127.0.0.1:4200/api/lora/train \
-  -H "Content-Type: application/json" \
-  -d '{"name": "narrator_warm", "dataset_id": "my_voice", "epochs": 25, "lr": "5e-6", "lora_r": 32, "lora_alpha": 64}'
-
-# Check training status
-curl http://127.0.0.1:4200/api/status/lora_training
-
-# List trained adapters
-curl http://127.0.0.1:4200/api/lora/models
-
-# Test a trained adapter
-curl -X POST http://127.0.0.1:4200/api/lora/test \
-  -H "Content-Type: application/json" \
-  -d '{"adapter_id": "narrator_warm_1234567890", "text": "Test line.", "instruct": "Calm narration."}'
-
-# Delete an adapter
-curl -X DELETE http://127.0.0.1:4200/api/lora/models/adapter_id_here
-```
-
-### Dataset Builder
-```bash
-# List all dataset builder projects
-curl http://127.0.0.1:4200/api/dataset_builder/list
-
-# Create a new project
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/create \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset"}'
-
-# Update project metadata (description and global seed)
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/update_meta \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset", "description": "A warm male narrator", "global_seed": "42"}'
-
-# Update sample rows
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/update_rows \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset", "rows": [{"text": "Hello world.", "emotion": "cheerful"}]}'
-
-# Generate a single sample preview
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/generate_sample \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset", "description": "A warm male voice", "sample_index": 0, "samples": [{"text": "Hello.", "emotion": "cheerful"}]}'
-
-# Batch generate all samples
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/generate_batch \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset", "description": "A warm male voice", "samples": [{"text": "Hello.", "emotion": "cheerful"}]}'
-
-# Check batch generation status
-curl http://127.0.0.1:4200/api/dataset_builder/status/my_voice_dataset
-
-# Cancel a running batch generation
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/cancel \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset"}'
-
-# Save project as a training dataset
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/save \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset", "ref_sample_index": 0}'
-
-# Delete a project
-curl -X DELETE http://127.0.0.1:4200/api/dataset_builder/my_voice_dataset
-```
-
-### Audio Download
-```bash
-# Download audiobook (after merging in editor)
-curl http://127.0.0.1:4200/api/audiobook --output audiobook.mp3
-
-# Export to Audacity (per-speaker tracks + LOF + labels)
-curl -X POST http://127.0.0.1:4200/api/export_audacity
-
-# Poll for completion
-curl http://127.0.0.1:4200/api/status/audacity_export
-
-# Download the zip
-curl http://127.0.0.1:4200/api/export_audacity --output audacity_export.zip
-```
-
-## Python Integration
-
-```python
-import requests
-
-BASE = "http://127.0.0.1:4200"
-
-# Upload and generate script
-with open("mybook.txt", "rb") as f:
-    requests.post(f"{BASE}/api/upload", files={"file": f})
-
-requests.post(f"{BASE}/api/generate_script")
-
-# Poll for completion
-import time
-while True:
-    status = requests.get(f"{BASE}/api/status/script_generation").json()
-    if status.get("status") in ["completed", "error"]:
-        break
-    time.sleep(2)
-
-# Configure voices
-voice_config = {
-    "NARRATOR": {"type": "custom", "voice": "Ryan", "character_style": "calm narrator"},
-    "HERO": {"type": "custom", "voice": "Aiden", "character_style": "brave, determined"}
-}
-requests.post(f"{BASE}/api/save_voice_config", json=voice_config)
-
-# Fast batch render all chunks
-chunks = requests.get(f"{BASE}/api/chunks").json()
-indices = [c["id"] for c in chunks]
-requests.post(f"{BASE}/api/generate_batch_fast", json={"indices": indices})
-# ... poll until all chunks status == "done" ...
-requests.post(f"{BASE}/api/merge")
-
-# Download
-with open("output.mp3", "wb") as f:
-    f.write(requests.get(f"{BASE}/api/audiobook").content)
-
-# Export to Audacity
-requests.post(f"{BASE}/api/export_audacity")
-# ... poll /api/status/audacity_export until not running ...
-with open("audacity_export.zip", "wb") as f:
-    f.write(requests.get(f"{BASE}/api/export_audacity").content)
-```
-
-## JavaScript Integration
-
-```javascript
-const BASE = "http://127.0.0.1:4200";
-
-// Upload file
-const formData = new FormData();
-formData.append("file", fileInput.files[0]);
-await fetch(`${BASE}/api/upload`, { method: "POST", body: formData });
-
-// Generate script
-await fetch(`${BASE}/api/generate_script`, { method: "POST" });
-
-// Poll for completion
-async function waitForTask(taskName) {
-  while (true) {
-    const res = await fetch(`${BASE}/api/status/${taskName}`);
-    const data = await res.json();
-    if (data.status === "completed" || data.status === "error") return data;
-    await new Promise(r => setTimeout(r, 2000));
-  }
-}
-await waitForTask("script_generation");
-
-// Configure and generate
-await fetch(`${BASE}/api/save_voice_config`, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    NARRATOR: { type: "custom", voice: "Ryan", character_style: "calm" }
-  })
-});
-
-// Fast batch render all chunks
-const chunks = await (await fetch(`${BASE}/api/chunks`)).json();
-const indices = chunks.map(c => c.id);
-await fetch(`${BASE}/api/generate_batch_fast`, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ indices })
-});
-// ... poll until all chunks done ...
-
-// Merge into final audiobook
-await fetch(`${BASE}/api/merge`, { method: "POST" });
-
-// Export to Audacity
-await fetch(`${BASE}/api/export_audacity`, { method: "POST" });
-// ... poll /api/status/audacity_export until not running ...
-// Download zip from GET /api/export_audacity
-```
 
 ## Recommended LLM Models
 
@@ -854,7 +562,7 @@ For script generation, non-thinking models work best:
 - Check the Pinokio terminal for model loading errors
 - Ensure sufficient VRAM (16+ GB recommended for bfloat16)
 - For external mode, ensure the Gradio TTS server is running at the configured URL
-- Check voice_config.json has valid settings for all speakers
+- Check every speaker card has a valid voice configuration and any clone reference still exists in this browser
 - For clone voices, verify reference audio exists and transcript is accurate
 
 ### Slow batch generation
