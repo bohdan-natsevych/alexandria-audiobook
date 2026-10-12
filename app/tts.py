@@ -17,6 +17,19 @@ def sanitize_filename(name):
     return name.lower()
 
 
+def audacity_track_filenames(speakers):
+    """Assign deterministic, unique ASCII WAV names, including on case-insensitive filesystems.
+
+    Sorted numbering makes the mapping independent of timeline order; the bounded
+    label is only for readability. The prefix also avoids Windows reserved names.
+    """
+    names = {}
+    for index, speaker in enumerate(sorted(set(speakers)), 1):
+        label = re.sub(r"[^a-z0-9_-]", "_", speaker.lower())[:64].strip("_") or "speaker"
+        names[speaker] = f"track_{index:04d}_{label}.wav"
+    return names
+
+
 def combine_audio_with_pauses(audio_segments, speakers, pause_ms=DEFAULT_PAUSE_MS,
                               same_speaker_pause_ms=SAME_SPEAKER_PAUSE_MS,
                               pause_overrides=None):

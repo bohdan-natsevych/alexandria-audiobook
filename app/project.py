@@ -14,6 +14,7 @@ from tts import (
     combine_audio_with_pauses,
     compute_timeline,
     sanitize_filename,
+    audacity_track_filenames,
     DEFAULT_PAUSE_MS,
     SAME_SPEAKER_PAUSE_MS
 )
@@ -508,11 +509,12 @@ class ProjectManager:
 
             speaker_tracks[speaker] = track
 
+        track_filenames = audacity_track_filenames(speakers_ordered)
+
         # Phase 3 — Build LOF and labels content
         lof_lines = []
         for speaker in speakers_ordered:
-            safe_name = sanitize_filename(speaker)
-            lof_lines.append(f'file "{safe_name}.wav"')
+            lof_lines.append(f'file "{track_filenames[speaker]}"')
         lof_content = "\n".join(lof_lines) + "\n"
 
         label_lines = []
@@ -531,10 +533,9 @@ class ProjectManager:
             zf.writestr("labels.txt", labels_content)
 
             for speaker in speakers_ordered:
-                safe_name = sanitize_filename(speaker)
                 wav_buffer = io.BytesIO()
                 speaker_tracks[speaker].export(wav_buffer, format="wav")
-                zf.writestr(f"{safe_name}.wav", wav_buffer.getvalue())
+                zf.writestr(track_filenames[speaker], wav_buffer.getvalue())
 
         return True, zip_path
 
