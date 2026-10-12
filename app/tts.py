@@ -1388,22 +1388,50 @@ class TTSEngine:
         return results
 
     def _espeech_batch_clone(self, chunks, voice_config, output_dir):
-        """Sequential ESpeech clone generation (F5-TTS has no Qwen-style batch API)."""
+        """Batch ESpeech clone generation, grouped by speaker.
+
+        Chunks sharing a speaker share one reference voice, so their text
+        pieces go through the model together. Pieces are split into model
+        calls by the same sub-batch settings as the Qwen batch paths.
+        """
+        import time
+
         results = {"completed": [], "failed": []}
-        print(f"Batch [ESpeech]: generating {len(chunks)} clone chunks...")
+
+        speaker_groups = {}
         for chunk in chunks:
-            idx = chunk["index"]
-            output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
+            speaker_groups.setdefault(chunk.get("speaker", ""), []).append(chunk)
+
+        engine = self._get_espeech()
+        print(f"Batch [ESpeech]: {len(chunks)} clone chunks across {len(speaker_groups)} speaker(s)")
+
+        for speaker, group in speaker_groups.items():
+            indices = [c["index"] for c in group]
+            output_paths = [os.path.join(output_dir, f"temp_batch_{idx}.wav") for idx in indices]
             try:
-                success = self._espeech_generate_clone(
-                    chunk["text"], chunk["speaker"], voice_config, output_path
+                ref_audio_path, ref_text = self._resolve_clone_refs(speaker, voice_config)
+                voice_data = voice_config.get(speaker) or {}
+                t_start = time.time()
+                successes = engine.synthesize_batch(
+                    texts=[c["text"] for c in group],
+                    ref_audio_path=ref_audio_path,
+                    ref_text=ref_text,
+                    output_paths=output_paths,
+                    seed=int(voice_data.get("seed", -1)),
+                    plan_sub_batches=self._build_sub_batches,
                 )
-                if success:
-                    results["completed"].append(idx)
-                else:
-                    results["failed"].append((idx, "ESpeech clone generation failed"))
+                print(f"  Speaker '{speaker}': {len(group)} chunks in {time.time() - t_start:.1f}s")
+                for idx, success in zip(indices, successes):
+                    if success:
+                        results["completed"].append(idx)
+                    else:
+                        results["failed"].append((idx, "ESpeech returned no audio (empty text?)"))
             except Exception as e:
-                results["failed"].append((idx, str(e)))
+                import traceback
+                print(f"  Error generating ESpeech batch for '{speaker}': {e}")
+                traceback.print_exc()
+                for idx in indices:
+                    results["failed"].append((idx, str(e)))
             self._clear_gpu_cache()
         return results
 

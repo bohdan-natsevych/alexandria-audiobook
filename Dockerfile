@@ -10,8 +10,7 @@ RUN apt-get update && \
 # Install Python dependencies
 COPY app/requirements.txt /alexandria/app/requirements.txt
 RUN pip install --no-cache-dir -r app/requirements.txt && \
-    pip install --no-cache-dir qwen-tts==0.1.1 && \
-    pip install --no-cache-dir f5-tts ruaccent
+    pip install --no-cache-dir qwen-tts==0.1.1
 
 # Copy application code
 COPY app/ /alexandria/app/

@@ -18,8 +18,7 @@ module.exports = {
       message: [
         "uv pip uninstall google-genai",
         "uv pip install -r requirements.txt",
-        "uv pip install qwen-tts==0.1.1",
-        "uv pip install f5-tts ruaccent"
+        "uv pip install qwen-tts==0.1.1"
       ]
     }
   }, {
