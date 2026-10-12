@@ -284,6 +284,8 @@ class ProjectManager:
         chunks = self.load_chunks()
         if 0 <= index < len(chunks):
             chunk = chunks[index]
+            changed = any(key in data and data[key] != chunk.get(key)
+                          for key in ("text", "instruct", "speaker"))
             # Update fields
             if "text" in data: chunk["text"] = data["text"]
             if "instruct" in data: chunk["instruct"] = data["instruct"]
@@ -296,9 +298,10 @@ class ProjectManager:
                 else:
                     chunk.pop("pause_after", None)
 
-            # If text/instruct/speaker changed, reset status (but keep old audio until regen)
-            if "text" in data or "instruct" in data or "speaker" in data:
+            # Audio belongs to the previous synthesis inputs. Invalidate its reference.
+            if changed:
                 chunk["status"] = "pending"
+                chunk["audio_path"] = None
 
             self.save_chunks(chunks)
             return chunk
@@ -425,6 +428,9 @@ class ProjectManager:
         chunks = self.load_chunks()
         result = []
         for chunk in chunks:
+            # Also reject stale references persisted by older versions or failed regeneration.
+            if chunk.get("status") != "done":
+                continue
             path = chunk.get("audio_path")
             if not path:
                 continue
