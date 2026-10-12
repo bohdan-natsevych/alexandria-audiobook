@@ -85,7 +85,7 @@ def merge_consecutive_narrators(entries, max_merged_length=800):
 def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                  previous_tail=None, source_context=None, max_retries=2,
                  system_prompt=None, user_prompt_template=None,
-                 max_tokens=8000, temperature=0.4, top_p=0.8, top_k=20,
+                 max_tokens=8000, temperature=0.4, top_p=0.8, top_k=0,
                  min_p=0, presence_penalty=0.0, banned_tokens=None):
     """Send a batch of script entries through the LLM for review and correction."""
     sys_prompt = system_prompt or REVIEW_SYSTEM_PROMPT
@@ -123,8 +123,8 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                     max_tokens=max_tokens,
                     extra_body={} if is_gemini_model(model_name) else {
                         k: v for k, v in {
-                            "top_k": top_k,
-                            "min_p": min_p,
+                            "top_k": top_k if top_k else None,
+                            "min_p": min_p if min_p else None,
                             "banned_tokens": banned_tokens if banned_tokens else None,
                         }.items() if v is not None
                     }
@@ -341,7 +341,7 @@ def main():
     max_tokens = generation_config.get("max_tokens", 8000)
     temperature = generation_config.get("temperature", 0.4)
     top_p = generation_config.get("top_p", 0.8)
-    top_k = generation_config.get("top_k", 20)
+    top_k = generation_config.get("top_k", 0)
     min_p = generation_config.get("min_p", 0)
     presence_penalty = generation_config.get("presence_penalty", 0.0)
     banned_tokens = generation_config.get("banned_tokens", [])
