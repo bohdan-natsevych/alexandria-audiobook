@@ -3,6 +3,7 @@ import sys
 import json
 import re
 import argparse
+from difflib import SequenceMatcher
 from openai import OpenAI
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
 
@@ -11,169 +12,89 @@ from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
 SINGLE_SPEAKER_MAX_CHARS = 500
 
 def clean_json_string(text):
-    """Clean and extract valid JSON array from LLM response."""
-    # Remove thinking tags (various formats used by different models)
-    # GLM, DeepSeek, Qwen, etc. use different thinking tag formats
-    text = re.sub(r'<think>[\s\S]*?</think>', '', text)
-    text = re.sub(r'<thinking>[\s\S]*?</thinking>', '', text)
-    text = re.sub(r'<reflection>[\s\S]*?</reflection>', '', text)
-    text = re.sub(r'<reasoning>[\s\S]*?</reasoning>', '', text)
-    # Handle unclosed thinking tags (model started thinking but didn't close)
-    text = re.sub(r'<think>[\s\S]*$', '', text)
-    text = re.sub(r'<thinking>[\s\S]*$', '', text)
-
-    # Remove markdown code blocks
-    if "```" in text:
-        # Find content between ```json and ``` or just ``` and ```
-        match = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
-        if match:
-            text = match.group(1).strip()
-
-    # Find the JSON array - match from first [ to its closing ]
-    # Use a bracket counter to find the correct closing bracket
+    """Extract a complete array without rewriting or truncating string contents."""
+    # Thinking wrappers are removed only from the response prefix, never JSON values.
+    text = re.sub(r'^\s*<(think|thinking|reflection|reasoning)>[\s\S]*?</\1>\s*', '', text)
     start = text.find('[')
-    if start == -1:
+    if start < 0:
         return None
-
-    bracket_count = 0
-    end = -1
-    in_string = False
-    escape_next = False
-
-    for i, char in enumerate(text[start:], start):
-        if escape_next:
-            escape_next = False
-            continue
-        if char == '\\':
-            escape_next = True
-            continue
-        if char == '"' and not escape_next:
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if char == '[':
-            bracket_count += 1
-        elif char == ']':
-            bracket_count -= 1
-            if bracket_count == 0:
-                end = i + 1
-                break
-
-    if end == -1:
-        # No closing bracket found, try to salvage
-        last_complete = text.rfind('},')
-        if last_complete > start:
-            return text[start:last_complete+1] + ']'
+    try:
+        value, end = json.JSONDecoder().raw_decode(text, start)
+    except (json.JSONDecodeError, ValueError):
         return None
-
-    json_text = text[start:end]
-
-    # Clean control characters inside strings (common LLM issue)
-    # Replace literal newlines/tabs inside JSON strings with escaped versions
-    def fix_control_chars(match):
-        s = match.group(0)
-        # Replace unescaped control characters
-        s = s.replace('\n', '\\n')
-        s = s.replace('\r', '\\r')
-        s = s.replace('\t', '\\t')
-        return s
-
-    # Fix control characters inside string values
-    json_text = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"', fix_control_chars, json_text)
-
-    return json_text
+    return text[start:end] if isinstance(value, list) else None
 
 
 def repair_json_array(json_text):
-    """Attempt to repair common JSON array issues from LLM output."""
+    """Accept only complete arrays of valid script entries; never salvage a prefix."""
     if not json_text:
         return None
-
-    def _filter_entries(lst):
-        """Keep only dict entries; LLMs sometimes emit bare strings in the array."""
-        filtered = [e for e in lst if isinstance(e, dict)]
-        if len(filtered) < len(lst):
-            print(f"  Warning: Dropped {len(lst) - len(filtered)} non-object entries from LLM JSON array")
-        return filtered if filtered else None
-
-    # Try parsing as-is first
     try:
-        result = json.loads(json_text)
-        if isinstance(result, list):
-            return _filter_entries(result)
-    except json.JSONDecodeError:
-        pass
+        entries = json.loads(json_text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(entries, list) or not entries:
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict) or any(
+            not isinstance(entry.get(key), str) for key in ('speaker', 'text', 'instruct')
+        ) or not entry['speaker'].strip() or not entry['text'].strip():
+            return None
+    return entries
 
-    # Fix 1: Add missing commas between objects (}\s*{" -> },\n{")
-    fixed = re.sub(r'\}\s*\{', '},\n{', json_text)
-    try:
-        result = json.loads(fixed)
-        if isinstance(result, list):
-            return _filter_entries(result)
-    except json.JSONDecodeError:
-        pass
-
-    # Fix 2: Remove trailing commas before ]
-    fixed = re.sub(r',\s*\]', ']', fixed)
-    try:
-        result = json.loads(fixed)
-        if isinstance(result, list):
-            return _filter_entries(result)
-    except json.JSONDecodeError:
-        pass
-
-    # Fix 3: Try to extract individual entries and rebuild
-    entries = []
-    # Match individual JSON objects
-    pattern = r'\{\s*"speaker"\s*:\s*"[^"]*"\s*,\s*"text"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"instruct"\s*:\s*"(?:[^"\\]|\\.)*"\s*\}'
-    matches = re.findall(pattern, json_text, re.DOTALL)
-
-    for match in matches:
-        try:
-            entry = json.loads(match)
-            entries.append(entry)
-        except json.JSONDecodeError:
-            continue
-
-    if entries:
-        return entries
-
-    # Fix 4: Last resort - find last complete entry and truncate
-    last_complete = json_text.rfind('},')
-    if last_complete > 0:
-        try:
-            truncated = json_text[:last_complete+1] + ']'
-            # Ensure it starts with [
-            if not truncated.strip().startswith('['):
-                truncated = '[' + truncated
-            result = json.loads(truncated)
-            if isinstance(result, list):
-                return _filter_entries(result)
-        except json.JSONDecodeError:
-            pass
-
-    return None
 
 def salvage_json_entries(json_text):
-    """Last resort: extract individual valid entries with regex."""
-    entries = []
-    # Match individual JSON objects with speaker, text, instruct fields
-    pattern = r'\{\s*"speaker"\s*:\s*"([^"]*)"\s*,\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"instruct"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}'
-    matches = re.finditer(pattern, json_text, re.DOTALL)
+    """Compatibility entry point: incomplete or malformed output is never publishable."""
+    return None
 
-    for match in matches:
-        try:
-            entry = {
-                "speaker": match.group(1),
-                "text": match.group(2).replace('\\"', '"').replace('\\n', '\n'),
-                "instruct": match.group(3).replace('\\"', '"').replace('\\n', '\n')
-            }
-            entries.append(entry)
-        except Exception:
-            continue
 
-    return entries if entries else None
+def _coverage_text(text):
+    """Normalize common formatting allowed by default_prompts.txt for coverage only."""
+    # Remove simple dialogue attribution adjacent to a closing quote. Keep actions.
+    text = re.sub(
+        r'([\"”])\s*[,;]?\s*(?:(?:he|she|they|[A-Z][\w-]*)\s+(?:said|replied|asked|answered)|'
+        r'(?:said|replied|asked|answered)\s+(?:he|she|they|[A-Z][\w-]*))\b',
+        r'\1', text)
+    text = text.casefold().replace('&', ' and ')
+    for short, full in (('dr', 'doctor'), ('mr', 'mister'), ('mrs', 'missus'), ('ms', 'miz')):
+        text = re.sub(r'\b' + short + r'\.', full, text)
+    numbers = ('one two three four five six seven eight nine ten eleven twelve thirteen '
+               'fourteen fifteen sixteen seventeen eighteen nineteen twenty').split()
+    ordinals = ('first second third fourth fifth sixth seventh eighth ninth tenth eleventh twelfth '
+                'thirteenth fourteenth fifteenth sixteenth seventeenth eighteenth nineteenth twentieth').split()
+    romans = 'i ii iii iv v vi vii viii ix x xi xii xiii xiv xv xvi xvii xviii xix xx'.split()
+    for i, (word, ordinal, roman) in enumerate(zip(numbers, ordinals, romans), 1):
+        text = re.sub(r'\bchapter\s+' + roman + r'\b', 'chapter ' + word, text)
+        text = re.sub(r'\b(?:' + ordinal + '|' + str(i) + r'(?:st|nd|rd|th))\b', word, text)
+    return text
+
+
+def source_coverage_passes(source, entries):
+    """Reject substantial or whole-sentence omissions, allowing prompt formatting.
+
+    This is a conservative lexical coverage gate, not proof of exact fidelity.
+    Ordered matches prevent repetitions elsewhere from replacing missing passages.
+    A per-sentence check catches short lost endings even in otherwise long chunks.
+    """
+    source = _coverage_text(source)
+    sentences = [re.findall(r"\w+", part) for part in re.split(r'[.!?]+|\n+', source)]
+    sentences = [words for words in sentences if words]
+    original = [word for sentence in sentences for word in sentence]
+    spoken = re.findall(r"\w+", _coverage_text(' '.join(e['text'] for e in entries)))
+    if not original or not spoken:
+        return False
+    matched = set()
+    for block in SequenceMatcher(None, original, spoken, autojunk=False).get_matching_blocks():
+        matched.update(range(block.a, block.a + block.size))
+    if len(matched) / len(original) < 0.90:
+        return False
+    offset = 0
+    for sentence in sentences:
+        coverage = sum(i in matched for i in range(offset, offset + len(sentence))) / len(sentence)
+        if coverage < 0.80:
+            return False
+        offset += len(sentence)
+    return True
 
 
 def fix_mojibake(text):
@@ -308,7 +229,10 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
             print()
 
             if finish_reason == "length":
-                print(f"  WARNING: Response was truncated (hit max_tokens={max_tokens}). Consider increasing max_tokens.")
+                print(f"  WARNING: Response was truncated (hit max_tokens={max_tokens}); retrying without accepting partial entries.")
+                if attempt < max_retries:
+                    continue
+                return []
 
         except Exception as e:
             print(f"Error calling LLM API (attempt {attempt + 1}): {e}")
@@ -330,6 +254,10 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
         # Try to parse, with repair attempts
         entries = repair_json_array(json_text)
 
+        if entries and not source_coverage_passes(chunk, entries):
+            print(f"Warning: source coverage failed for chunk {chunk_num} (attempt {attempt + 1})")
+            entries = None
+
         if entries and len(entries) > 0:
             if attempt > 0:
                 print(f"  Succeeded on retry {attempt + 1}")
@@ -342,11 +270,6 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
         if attempt < max_retries:
             print("Retrying with lower temperature...")
 
-        # Last resort: extract individual valid entries with regex
-        salvaged_entries = salvage_json_entries(json_text)
-        if salvaged_entries:
-            print(f"Regex-salvaged {len(salvaged_entries)} entries from malformed response")
-            return salvaged_entries
 
     return []
 
@@ -486,6 +409,9 @@ def main():
             presence_penalty=presence_penalty,
             banned_tokens=banned_tokens
         )
+        if not entries:
+            print(f"Error: chunk {i}/{total_chunks} failed validation; existing script has been retained.")
+            sys.exit(1)
         all_entries.extend(entries)
         print(f"  Got {len(entries)} entries")
 
