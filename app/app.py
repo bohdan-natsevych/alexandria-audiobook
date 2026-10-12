@@ -250,6 +250,8 @@ class VoiceConfigItem(BaseModel):
     adapter_id: Optional[str] = None
     adapter_path: Optional[str] = None
     description: Optional[str] = ""  # voice description (for design type)
+    alias_of: Optional[str] = None  # speaker whose voice this speaker reuses
+    persona_ref: Optional[str] = None  # per-character reference file from advanced persona generation
 
 class ChunkUpdate(BaseModel):
     text: Optional[str] = None
@@ -920,9 +922,6 @@ async def cancel_persona():
 
 @app.post("/api/save_voice_config")
 async def save_voice_config(config_data: Dict[str, VoiceConfigItem]):
-    # Read existing to preserve any fields not sent?
-    # For now, we assume frontend sends full config or we just overwrite specific keys
-
     current_config = {}
     if os.path.exists(VOICE_CONFIG_PATH):
         with open(VOICE_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -931,10 +930,14 @@ async def save_voice_config(config_data: Dict[str, VoiceConfigItem]):
             except (json.JSONDecodeError, ValueError):
                 pass
 
-    # Update current config with new data
+    # CLAUDE CODE: Merge instead of replace. Voice cards only send the fields
+    # they display, so a full replace would wipe fields written by persona
+    # generation (e.g. ref_text of a design voice). A field sent as null is
+    # removed, which is how the UI clears alias_of.
     for voice_name, config in config_data.items():
-        # Convert Pydantic model to dict
-        current_config[voice_name] = config.model_dump()
+        entry = dict(current_config.get(voice_name) or {})
+        entry.update(config.model_dump(exclude_unset=True))
+        current_config[voice_name] = {k: v for k, v in entry.items() if v is not None}
 
     atomic_json_write(current_config, VOICE_CONFIG_PATH)
 

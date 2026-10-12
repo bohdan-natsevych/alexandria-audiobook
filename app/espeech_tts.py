@@ -19,7 +19,11 @@ class ESpeechEngine:
 
     def __init__(self, device="auto"):
         self._device_pref = device
-        self._lock = threading.Lock()
+        # CLAUDE CODE: Reentrant because synthesize() holds it while calling
+        # _ensure_loaded(). It also serializes inference: parallel TTS workers
+        # share this instance, and RUAccent, the F5 model and the global torch
+        # seed are not safe to use from several threads at once.
+        self._lock = threading.RLock()
         self._model = None
         self._vocoder = None
         self._accentizer = None
@@ -122,43 +126,44 @@ class ESpeechEngine:
         if not text or not str(text).strip():
             raise ValueError("ESpeech generation text is empty")
 
-        self._ensure_loaded()
-
         from f5_tts.infer.utils_infer import infer_process, preprocess_ref_audio_text
 
-        if seed is None or int(seed) < 0:
-            seed = int(np.random.randint(0, 2**31 - 1))
-        torch.manual_seed(int(seed))
+        with self._lock:
+            self._ensure_loaded()
 
-        processed_ref_text = self._accent(ref_text)
-        processed_gen_text = self._accent(text)
+            if seed is None or int(seed) < 0:
+                seed = int(np.random.randint(0, 2**31 - 1))
+            torch.manual_seed(int(seed))
 
-        ref_audio_proc, processed_ref_text_final = preprocess_ref_audio_text(
-            ref_audio_path,
-            processed_ref_text,
-            show_info=print,
-        )
+            processed_ref_text = self._accent(ref_text)
+            processed_gen_text = self._accent(text)
 
-        inference = infer_process(
-            ref_audio_proc,
-            processed_ref_text_final,
-            processed_gen_text,
-            self._model,
-            self._vocoder,
-            cross_fade_duration=cross_fade_duration,
-            nfe_step=nfe_step,
-            speed=speed,
-            show_info=print,
-        )
+            ref_audio_proc, processed_ref_text_final = preprocess_ref_audio_text(
+                ref_audio_path,
+                processed_ref_text,
+                show_info=print,
+            )
 
-        # F5-TTS releases differ here: older versions return the result tuple
-        # directly, while current versions yield it from an iterator.
-        if not isinstance(inference, tuple):
-            inference = next(inference, None)
-        if inference is None:
-            return False
+            inference = infer_process(
+                ref_audio_proc,
+                processed_ref_text_final,
+                processed_gen_text,
+                self._model,
+                self._vocoder,
+                cross_fade_duration=cross_fade_duration,
+                nfe_step=nfe_step,
+                speed=speed,
+                show_info=print,
+            )
 
-        wave, sample_rate, _ = inference
+            # F5-TTS releases differ here: older versions return the result tuple
+            # directly, while current versions yield it from an iterator.
+            if not isinstance(inference, tuple):
+                inference = next(inference, None)
+            if inference is None:
+                return False
+
+            wave, sample_rate, _ = inference
 
         if wave is None:
             return False
