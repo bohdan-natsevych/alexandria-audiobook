@@ -3,9 +3,10 @@ import sys
 import json
 import re
 import argparse
+import hashlib
 from openai import OpenAI
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
-from utils import is_gemini_model
+from utils import atomic_json_write, is_gemini_model
 
 # Cap for single-speaker mode: entries at this size pass through
 # group_into_chunks (MAX_CHUNK_CHARS=500) as-is without further splitting.
@@ -351,6 +352,30 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
 
     return []
 
+SCRIPT_PROGRESS_PATH = os.path.join("..", "script_progress.json")
+
+
+def _script_fingerprint(book_content, chunk_size):
+    """Identify the book and chunking a checkpoint belongs to."""
+    return hashlib.sha256(f"{chunk_size}\n{book_content}".encode("utf-8")).hexdigest()
+
+
+def _load_script_progress(fingerprint):
+    """Return (completed_chunks, entries) from a matching checkpoint, else (0, [])."""
+    if not os.path.exists(SCRIPT_PROGRESS_PATH):
+        return 0, []
+    try:
+        with open(SCRIPT_PROGRESS_PATH, "r", encoding="utf-8") as f:
+            progress = json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        print(f"Warning: ignoring unreadable script checkpoint ({e})")
+        return 0, []
+    if progress.get("fingerprint") != fingerprint:
+        print("Ignoring script checkpoint from a different book or chunk size.")
+        return 0, []
+    return int(progress.get("completed_chunks", 0)), list(progress.get("entries", []))
+
+
 def _write_script_output(all_entries):
     """Write annotated_script.json and clear stale chunks.json."""
     output_path = os.path.join("..", "annotated_script.json")
@@ -469,8 +494,15 @@ def main():
 
     print(f"Split into {total_chunks} chunks at paragraph/sentence boundaries")
 
-    all_entries = []
+    fingerprint = _script_fingerprint(book_content, chunk_size)
+    completed_chunks, all_entries = _load_script_progress(fingerprint)
+    if completed_chunks:
+        print(f"Resuming from checkpoint: {completed_chunks}/{total_chunks} chunks already done "
+              f"({len(all_entries)} entries)")
+
     for i, chunk in enumerate(chunks, 1):
+        if i <= completed_chunks:
+            continue
         print(f"Processing chunk {i}/{total_chunks} ({len(chunk)} chars)...")
 
         previous = all_entries if len(all_entries) > 0 else None
@@ -487,14 +519,29 @@ def main():
             presence_penalty=presence_penalty,
             banned_tokens=banned_tokens
         )
+        # CLAUDE CODE: Every chunk contains text, so no entries means the LLM
+        # call failed (e.g. quota exhausted). Stop instead of silently leaving
+        # a gap in the book; the checkpoint lets the next run retry this chunk.
+        if not entries:
+            print(f"Error: chunk {i}/{total_chunks} produced no entries after retries. "
+                  f"Progress is saved; run Generate Script again to resume from this chunk.")
+            sys.exit(1)
+
         all_entries.extend(entries)
         print(f"  Got {len(entries)} entries")
+        atomic_json_write({
+            "fingerprint": fingerprint,
+            "total_chunks": total_chunks,
+            "completed_chunks": i,
+            "entries": all_entries,
+        }, SCRIPT_PROGRESS_PATH)
 
     if not all_entries:
         print("Error: No script entries generated")
         sys.exit(1)
 
     _write_script_output(all_entries)
+    os.remove(SCRIPT_PROGRESS_PATH)
 
 
 if __name__ == '__main__':

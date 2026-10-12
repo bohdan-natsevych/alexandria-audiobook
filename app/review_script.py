@@ -3,10 +3,18 @@ import sys
 import json
 import re
 import argparse
+import hashlib
+import openai
 from openai import OpenAI
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
 from generate_script import clean_json_string, repair_json_array, salvage_json_entries
-from utils import is_gemini_model
+from utils import atomic_json_write, is_gemini_model
+
+REVIEW_PROGRESS_PATH = os.path.join(os.path.dirname(__file__), "..", "review_progress.json")
+
+
+class LLMUnavailableError(Exception):
+    """The LLM API kept failing (network, quota, server error), as opposed to a bad answer."""
 
 
 def _is_section_break(text):
@@ -102,24 +110,30 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
 
     for attempt in range(max_retries + 1):
         try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=temperature,
-                top_p=top_p,
-                presence_penalty=presence_penalty,
-                max_tokens=max_tokens,
-                extra_body={} if is_gemini_model(model_name) else {
-                    k: v for k, v in {
-                        "top_k": top_k,
-                        "min_p": min_p,
-                        "banned_tokens": banned_tokens if banned_tokens else None,
-                    }.items() if v is not None
-                }
-            )
+            try:
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=temperature,
+                    top_p=top_p,
+                    presence_penalty=presence_penalty,
+                    max_tokens=max_tokens,
+                    extra_body={} if is_gemini_model(model_name) else {
+                        k: v for k, v in {
+                            "top_k": top_k,
+                            "min_p": min_p,
+                            "banned_tokens": banned_tokens if banned_tokens else None,
+                        }.items() if v is not None
+                    }
+                )
+            except openai.APIError as e:
+                print(f"Error calling LLM API (attempt {attempt + 1}): {e}")
+                if attempt < max_retries:
+                    continue
+                raise LLMUnavailableError(str(e)) from e
 
             choice = response.choices[0]
             text = choice.message.content.strip()
@@ -147,8 +161,10 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
             if finish_reason == "length":
                 print(f"  WARNING: Response was truncated (hit max_tokens={max_tokens}). Consider increasing max_tokens or reducing batch size.")
 
+        except LLMUnavailableError:
+            raise
         except Exception as e:
-            print(f"Error calling LLM API (attempt {attempt + 1}): {e}")
+            print(f"Error reading LLM response (attempt {attempt + 1}): {e}")
             if attempt < max_retries:
                 continue
             return None
@@ -248,6 +264,28 @@ def diff_entries(original, corrected):
     return stats
 
 
+def _load_review_progress(fingerprint):
+    """Return the saved review state for this exact input and settings, else None."""
+    if not os.path.exists(REVIEW_PROGRESS_PATH):
+        return None
+    try:
+        with open(REVIEW_PROGRESS_PATH, "r", encoding="utf-8") as f:
+            progress = json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        print(f"Warning: ignoring unreadable review checkpoint ({e})")
+        return None
+    if progress.get("fingerprint") != fingerprint:
+        print("Ignoring review checkpoint from a different script or review settings.")
+        return None
+    return progress
+
+
+def _stop_for_unavailable_llm(batch_num, total_batches, error):
+    print(f"\nError: LLM API unavailable at batch {batch_num}/{total_batches}: {error}")
+    print("Progress is saved; run the review again to resume from this batch.")
+    sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Review and fix annotated audiobook script")
     parser.add_argument("--source", help="Path to original source text for comparison (mode 2, not yet implemented)")
@@ -326,13 +364,42 @@ def main():
         "batches_failed": 0,
     }
 
+    review_mode = f"context:{args.context_window}" if args.context_window and args.context_window > 0 else "plain"
+    fingerprint = hashlib.sha256(
+        f"{review_mode}\n{batch_size}\n{json.dumps(entries, ensure_ascii=False, sort_keys=True)}".encode("utf-8")
+    ).hexdigest()
+    completed_batches = 0
+    resume_tail = None
+    progress = _load_review_progress(fingerprint)
+    if progress:
+        completed_batches = int(progress.get("completed_batches", 0))
+        all_corrected = list(progress.get("all_corrected", []))
+        total_stats.update(progress.get("total_stats", {}))
+        resume_tail = progress.get("previous_tail")
+        print(f"Resuming from checkpoint: {completed_batches} batch(es) already reviewed")
+
+    def save_progress(batches_done, tail):
+        # CLAUDE CODE: Called before each new batch, so the checkpoint holds
+        # every batch finished so far. The last batch needs no checkpoint
+        # because the final script is written right after the loop.
+        atomic_json_write({
+            "fingerprint": fingerprint,
+            "completed_batches": batches_done,
+            "all_corrected": all_corrected,
+            "total_stats": total_stats,
+            "previous_tail": tail,
+        }, REVIEW_PROGRESS_PATH)
+
     if args.context_window and args.context_window > 0:
         window = max(1, args.context_window)
         total_batches = max(1, (len(entries) + batch_size - 1) // batch_size)
         print(f"Contextual review mode enabled: batching ~{batch_size} entries per LLM call with +/-{window} neighbors")
 
-        previous_tail = None
+        previous_tail = resume_tail
         for batch_index, start in enumerate(range(0, len(entries), batch_size), 1):
+            if batch_index <= completed_batches:
+                continue
+            save_progress(batch_index - 1, previous_tail)
             end = min(len(entries), start + batch_size)
             batch = entries[start:end]
             before = entries[max(0, start - window):start]
@@ -352,20 +419,23 @@ def main():
                 contextual_lines.append("\n--- NEXT ENTRIES (Context Only) ---")
                 contextual_lines.extend(json.dumps(e, ensure_ascii=False) for e in after)
 
-            corrected = review_batch(
-                client, model_name, batch, batch_index, total_batches,
-                previous_tail=None,  # contextual mode uses explicit before/after window instead
-                source_context="\n".join(contextual_lines),
-                system_prompt=review_sys,
-                user_prompt_template=review_usr,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                presence_penalty=presence_penalty,
-                banned_tokens=banned_tokens
-            )
+            try:
+                corrected = review_batch(
+                    client, model_name, batch, batch_index, total_batches,
+                    previous_tail=None,  # contextual mode uses explicit before/after window instead
+                    source_context="\n".join(contextual_lines),
+                    system_prompt=review_sys,
+                    user_prompt_template=review_usr,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    presence_penalty=presence_penalty,
+                    banned_tokens=banned_tokens
+                )
+            except LLMUnavailableError as e:
+                _stop_for_unavailable_llm(batch_index, total_batches, e)
 
             if corrected is None:
                 print(f"  FAILED — keeping original entries for batch {batch_index}")
@@ -419,25 +489,31 @@ def main():
         total_batches = len(batches)
         print(f"Split into {total_batches} batches of ~{batch_size} entries")
 
-        previous_tail = None
+        previous_tail = resume_tail
 
         for i, batch in enumerate(batches, 1):
+            if i <= completed_batches:
+                continue
+            save_progress(i - 1, previous_tail)
             print(f"\nReviewing batch {i}/{total_batches} ({len(batch)} entries)...")
 
-            corrected = review_batch(
-                client, model_name, batch, i, total_batches,
-                previous_tail=previous_tail,
-                source_context=None,  # Mode 2: would pass source text chunk here
-                system_prompt=review_sys,
-                user_prompt_template=review_usr,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                presence_penalty=presence_penalty,
-                banned_tokens=banned_tokens
-            )
+            try:
+                corrected = review_batch(
+                    client, model_name, batch, i, total_batches,
+                    previous_tail=previous_tail,
+                    source_context=None,  # Mode 2: would pass source text chunk here
+                    system_prompt=review_sys,
+                    user_prompt_template=review_usr,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    presence_penalty=presence_penalty,
+                    banned_tokens=banned_tokens
+                )
+            except LLMUnavailableError as e:
+                _stop_for_unavailable_llm(i, total_batches, e)
 
             if corrected is None:
                 print(f"  FAILED — keeping original entries for batch {i}")
@@ -500,6 +576,8 @@ def main():
     # Write corrected script
     with open(script_path, "w", encoding="utf-8") as f:
         json.dump(all_corrected, f, indent=2, ensure_ascii=False)
+    if os.path.exists(REVIEW_PROGRESS_PATH):
+        os.remove(REVIEW_PROGRESS_PATH)
 
     # Delete chunks.json so editor regenerates
     chunks_path = os.path.join(os.path.dirname(__file__), "..", "chunks.json")

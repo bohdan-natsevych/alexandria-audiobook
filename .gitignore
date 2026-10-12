@@ -37,6 +37,9 @@ audiobook.mp3
 
 # Generated runtime files
 chunks.json
+script_progress.json
+review_progress.json
+persona_progress.json
 temp_batch_*.wav
 app/flash-attention/
 error_screenshot.png

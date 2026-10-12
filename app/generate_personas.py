@@ -6,11 +6,47 @@ import re
 import argparse
 import shutil
 import tempfile
+import hashlib
+import openai
 from openai import OpenAI
 
 from tts import TTSEngine, sanitize_filename
 from utils import atomic_json_write as _atomic_json_write
 from persona_prompts import PERSONA_SYSTEM_PROMPT, PERSONA_USER_PROMPT, PERSONA_ADVANCED_PROMPT
+
+PERSONA_PROGRESS_FILE = "persona_progress.json"
+
+
+class LLMUnavailableError(Exception):
+    """The LLM API kept failing (network, quota, server error), as opposed to a bad answer."""
+
+
+def _chat(client, max_retries=2, **kwargs):
+    """chat.completions.create with retries; raises LLMUnavailableError when the API keeps failing."""
+    for attempt in range(max_retries + 1):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except openai.APIError as e:
+            print(f"Error calling LLM API (attempt {attempt + 1}): {e}")
+            if attempt == max_retries:
+                raise LLMUnavailableError(str(e)) from e
+
+
+def _load_persona_progress(path, fingerprint):
+    """Return saved progress for this exact script and settings, or a fresh state."""
+    fresh = {"fingerprint": fingerprint, "discovery_batches_done": 0, "speakers_done": [], "aliases": None}
+    if not os.path.exists(path):
+        return fresh
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            progress = json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        print(f"Warning: ignoring unreadable persona checkpoint ({e})")
+        return fresh
+    if progress.get("fingerprint") != fingerprint:
+        print("Ignoring persona checkpoint from a different script or persona settings.")
+        return fresh
+    return progress
 
 
 def extract_json_object(text):
@@ -521,28 +557,33 @@ def _save_generated_preview(root, engine, voice_config, speaker, description, re
         return False
 
 
-def run_advanced_persona_generation(script, selected_speakers, samples, voice_config, client, model_name, engine, root, args, system_prompt=None, advanced_prompt=None):
+def run_advanced_persona_generation(script, selected_speakers, samples, voice_config, client, model_name, engine, root, args, progress, checkpoint, max_tokens, system_prompt=None, advanced_prompt=None):
+    """Returns the number of speakers whose voice preview could not be generated."""
     ref_dir = os.path.join(root, "persona_refs")
     os.makedirs(ref_dir, exist_ok=True)
 
-    selected_set = set(selected_speakers)
     batches = list(_batch_entries(script, args.batch_size))
     print(f"Advanced persona generation enabled.")
     print(f"Writing per-character reference files to: {ref_dir}")
     print(f"Processing {len(script)} script entries in {len(batches)} batches of up to {max(1, int(args.batch_size or 40))}")
 
     for batch_number, (batch_start, batch) in enumerate(batches, start=1):
+        # CLAUDE CODE: Reference files are appended to per batch, so a resumed
+        # run must skip finished batches or their observations would be added twice.
+        if batch_number <= progress["discovery_batches_done"]:
+            continue
         prompt = _build_batch_discovery_prompt(batch_start, batch, selected_speakers)
         print(f"Advanced discovery batch {batch_number}/{len(batches)} ({len(batch)} entries)")
         try:
-            response = client.chat.completions.create(
+            response = _chat(
+                client,
                 model=model_name,
                 messages=[
                     {"role": "system", "content": "You produce concise JSON only."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
-                max_tokens=4000,
+                max_tokens=max_tokens,
             )
             raw_content = response.choices[0].message.content.strip()
             parsed = extract_json_object(raw_content)
@@ -559,6 +600,8 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
                 print(f"Warning: discovery batch {batch_number} returned no parseable characters; using speaker fallback.")
                 print(f"  LLM response (first 500 chars): {raw_content[:500]}")
                 characters = _fallback_batch_characters(batch)
+        except LLMUnavailableError:
+            raise
         except Exception as e:
             print(f"Warning: discovery batch {batch_number} failed: {e}; using speaker fallback.")
             characters = _fallback_batch_characters(batch)
@@ -578,8 +621,14 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
             character["name"] = canonical_speaker
             _append_character_ref(ref_dir, canonical_speaker, batch_number, character)
 
+        progress["discovery_batches_done"] = batch_number
+        checkpoint()
+
     print("Compiling character reference files into final voice personas.")
+    failed = 0
     for speaker in selected_speakers:
+        if speaker in progress["speakers_done"]:
+            continue
         ref = _load_character_ref(ref_dir, speaker)
         if not ref.get("sample_lines"):
             ref["sample_lines"] = [line for line in samples.get(speaker, [])[:8] if line]
@@ -589,19 +638,22 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
         description = ""
         ref_text = ""
         try:
-            response = client.chat.completions.create(
+            response = _chat(
+                client,
                 model=model_name,
                 messages=[
                     {"role": "system", "content": system_prompt or "You produce concise JSON only."},
                     {"role": "user", "content": _compile_character_prompt(ref, advanced_prompt)}
                 ],
                 temperature=0.25,
-                max_tokens=600,
+                max_tokens=max_tokens,
             )
             parsed = extract_json_object(response.choices[0].message.content.strip())
             if parsed:
                 description = str(parsed.get("description", "") or "").strip()
                 ref_text = str(parsed.get("ref_text", "") or "").strip()
+        except LLMUnavailableError:
+            raise
         except Exception as e:
             print(f"Warning: compile failed for {speaker}: {e}")
 
@@ -618,11 +670,177 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
         voice_entry = voice_config.get(speaker, {})
         voice_entry["persona_ref"] = os.path.relpath(_character_ref_path(ref_dir, speaker), root).replace('\\\\', '/')
         voice_config[speaker] = voice_entry
-        _save_generated_preview(root, engine, voice_config, speaker, description, ref_text)
+        if _save_generated_preview(root, engine, voice_config, speaker, description, ref_text):
+            progress["speakers_done"].append(speaker)
+        else:
+            failed += 1
+        checkpoint()
         time.sleep(0.5)
+    return failed
 
 
 # _atomic_json_write imported from utils
+
+
+def run_basic_persona_generation(selected_speakers, samples, narrator_context, voice_config, client,
+                                 model_name, engine, root, args, progress, checkpoint, max_tokens,
+                                 persona_system, persona_user):
+    """Returns the number of speakers whose persona or voice preview failed."""
+    print(f"Processing {len(selected_speakers)} speakers")
+
+    # CLAUDE CODE: Alias decisions compare speakers against voice_config as it
+    # was before this run. A resumed run reuses them, because by then
+    # voice_config already holds the speakers finished earlier.
+    if progress.get("aliases") is None:
+        # Step 1: Pre-process with exact heuristic + high-confidence fuzzy matching
+        resolved_aliases = {}
+        remaining_speakers = []
+
+        for speaker in selected_speakers:
+            existing_names = [n for n in voice_config.keys() if n != speaker]
+            # Fast heuristic exact check
+            norm_self = normalize_speaker_name(speaker)
+            heuristic_alias = ""
+            for candidate in existing_names:
+                if normalize_speaker_name(candidate) == norm_self and norm_self:
+                    heuristic_alias = candidate
+                    break
+
+            if not heuristic_alias and existing_names:
+                # High-confidence fuzzy check
+                heuristic_alias = _resolve_to_canonical(speaker, existing_names, threshold=0.8)
+
+            if heuristic_alias:
+                print(f"Fast heuristic/fuzzy alias detected: {speaker} -> {heuristic_alias}")
+                resolved_aliases[speaker] = heuristic_alias
+            else:
+                remaining_speakers.append(speaker)
+
+        # Step 2: One-shot batch alias resolution for the remaining speakers (if alias-check is enabled)
+        if args.alias_check and remaining_speakers:
+            print(f"Running one-shot batch alias resolution for {len(remaining_speakers)} candidates...")
+        
+            # Split remaining speakers into chunks of 25 to prevent context/output token exhaustion
+            chunk_size = 25
+            batch_mapping = {}
+        
+            for idx in range(0, len(remaining_speakers), chunk_size):
+                chunk = remaining_speakers[idx:idx + chunk_size]
+                speakers_info = {}
+                for speaker in chunk:
+                    speakers_info[speaker] = {
+                        "sample_lines": samples.get(speaker, []),
+                        "narrator_context": narrator_context.get(speaker, [])
+                    }
+            
+                # Use current configured names plus any previously resolved canonical names as existing references
+                existing_configured = list(voice_config.keys()) + list(batch_mapping.values())
+            
+                print(f"Resolving alias batch {idx//chunk_size + 1} ({len(chunk)} speakers)...")
+                chunk_mapping = _resolve_aliases_batch(client, model_name, speakers_info, existing_configured)
+                batch_mapping.update(chunk_mapping)
+
+            # Build case-insensitive normalized lookup mapping to survive LLM key casing changes
+            normalized_mapping = {}
+            for k, v in batch_mapping.items():
+                if k and v:
+                    normalized_mapping[normalize_speaker_name(k)] = v
+
+            for speaker in remaining_speakers:
+                norm_speaker = normalize_speaker_name(speaker)
+                resolved_name = normalized_mapping.get(norm_speaker, speaker)
+                if resolved_name != speaker:
+                    # LLM identified this as an alias!
+                    all_possible = list(voice_config.keys()) + remaining_speakers
+                    canonical_target = _resolve_to_canonical(resolved_name, all_possible, threshold=0.6)
+                    if canonical_target and canonical_target != speaker:
+                        print(f"Batch LLM alias detected: {speaker} -> {canonical_target}")
+                        resolved_aliases[speaker] = canonical_target
+                    else:
+                        print(f"Batch LLM mapped '{speaker}' to '{resolved_name}' but couldn't resolve canonical spelling. Treating as new.")
+
+        progress["aliases"] = resolved_aliases
+        progress["unique_speakers"] = [s for s in remaining_speakers if s not in resolved_aliases]
+        checkpoint()
+    resolved_aliases = progress["aliases"]
+    unique_speakers = progress["unique_speakers"]
+
+    # Apply all resolved aliases to voice_config
+    for speaker, alias_target in resolved_aliases.items():
+        voice_entry = voice_config.get(speaker, {})
+        voice_entry.update({
+            "alias_of": alias_target,
+            "seed": voice_entry.get("seed", -1),
+        })
+        voice_config[speaker] = voice_entry
+
+    # Step 3: Generate personas for remaining truly unique speakers
+    print(f"Generating personas for {len(unique_speakers)} unique speakers...")
+
+    failed = 0
+    for speaker in unique_speakers:
+        if speaker in progress["speakers_done"]:
+            continue
+        lines = samples.get(speaker, [])
+        try:
+            print(f"Generating persona for: {speaker} ({len(lines)} lines samples)")
+
+            sample_text = "\n".join(lines[:8])
+            intro_ctx = narrator_context.get(speaker, [])
+            intro_blob = "\n".join(intro_ctx) if intro_ctx else "(No nearby narrator intro lines found.)"
+
+            user_prompt = persona_user.format(
+                speaker=speaker,
+                narrator_context=intro_blob,
+                sample_lines=sample_text
+            )
+
+            response = _chat(
+                client,
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": persona_system},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=max_tokens,
+            )
+
+            text = response.choices[0].message.content.strip()
+            parsed = extract_json_object(text)
+            description = ""
+            ref_text = ""
+            if parsed:
+                description = str(parsed.get("description", "") or "").strip()
+                ref_text = str(parsed.get("ref_text", "") or "").strip()
+
+            if not description:
+                print(f"Warning: LLM did not return parseable JSON for {speaker}. Response preview:\n{text[:300]}")
+                # Fallback to compiled fallback persona
+                description, ref_text = _fallback_compiled_persona({
+                    "name": speaker,
+                    "sample_lines": lines
+                })
+
+            if not ref_text:
+                ref_text = pick_ref_text(lines)
+
+            # Generate and save voice preview
+            if _save_generated_preview(root, engine, voice_config, speaker, description, ref_text):
+                progress["speakers_done"].append(speaker)
+            else:
+                failed += 1
+            checkpoint()
+
+            time.sleep(0.5)
+
+        except LLMUnavailableError:
+            raise
+        except Exception as e:
+            failed += 1
+            print(f"Unhandled error for {speaker}: {e}")
+    return failed
+
 
 
 def main():
@@ -712,167 +930,66 @@ def main():
         print("No speakers to process.")
         return
 
-    if args.advanced:
-        run_advanced_persona_generation(
-            script=script,
-            selected_speakers=selected_speakers,
-            samples=samples,
-            voice_config=voice_config,
-            client=client,
-            model_name=model_name,
-            engine=engine,
-            root=root,
-            args=args,
-            system_prompt=persona_system,
-            advanced_prompt=persona_advanced,
-        )
-        try:
-            _atomic_json_write(voice_config, voice_config_path)
-            print(f"Updated voice_config saved to {voice_config_path}")
-        except Exception as e:
-            print(f"Failed to save voice_config.json: {e}")
-        return
+    max_tokens = int(config.get("generation", {}).get("max_tokens", 4096))
+    progress_path = os.path.join(root, PERSONA_PROGRESS_FILE)
+    fingerprint = hashlib.sha256(json.dumps({
+        "advanced": bool(args.advanced),
+        "batch_size": args.batch_size,
+        "alias_check": bool(args.alias_check),
+        "speakers": selected_speakers,
+        "script": script,
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    progress = _load_persona_progress(progress_path, fingerprint)
+    if progress["discovery_batches_done"] or progress["speakers_done"]:
+        print(f"Resuming from checkpoint: {len(progress['speakers_done'])} speaker(s) done, "
+              f"{progress['discovery_batches_done']} discovery batch(es) done")
 
-    print(f"Processing {len(selected_speakers)} speakers")
-
-    # Step 1: Pre-process with exact heuristic + high-confidence fuzzy matching
-    resolved_aliases = {}
-    remaining_speakers = []
-
-    for speaker in selected_speakers:
-        existing_names = [n for n in voice_config.keys() if n != speaker]
-        # Fast heuristic exact check
-        norm_self = normalize_speaker_name(speaker)
-        heuristic_alias = ""
-        for candidate in existing_names:
-            if normalize_speaker_name(candidate) == norm_self and norm_self:
-                heuristic_alias = candidate
-                break
-
-        if not heuristic_alias and existing_names:
-            # High-confidence fuzzy check
-            heuristic_alias = _resolve_to_canonical(speaker, existing_names, threshold=0.8)
-
-        if heuristic_alias:
-            print(f"Fast heuristic/fuzzy alias detected: {speaker} -> {heuristic_alias}")
-            resolved_aliases[speaker] = heuristic_alias
-        else:
-            remaining_speakers.append(speaker)
-
-    # Step 2: One-shot batch alias resolution for the remaining speakers (if alias-check is enabled)
-    if args.alias_check and remaining_speakers:
-        print(f"Running one-shot batch alias resolution for {len(remaining_speakers)} candidates...")
-        
-        # Split remaining speakers into chunks of 25 to prevent context/output token exhaustion
-        chunk_size = 25
-        batch_mapping = {}
-        
-        for idx in range(0, len(remaining_speakers), chunk_size):
-            chunk = remaining_speakers[idx:idx + chunk_size]
-            speakers_info = {}
-            for speaker in chunk:
-                speakers_info[speaker] = {
-                    "sample_lines": samples.get(speaker, []),
-                    "narrator_context": narrator_context.get(speaker, [])
-                }
-            
-            # Use current configured names plus any previously resolved canonical names as existing references
-            existing_configured = list(voice_config.keys()) + list(batch_mapping.values())
-            
-            print(f"Resolving alias batch {idx//chunk_size + 1} ({len(chunk)} speakers)...")
-            chunk_mapping = _resolve_aliases_batch(client, model_name, speakers_info, existing_configured)
-            batch_mapping.update(chunk_mapping)
-
-        # Build case-insensitive normalized lookup mapping to survive LLM key casing changes
-        normalized_mapping = {}
-        for k, v in batch_mapping.items():
-            if k and v:
-                normalized_mapping[normalize_speaker_name(k)] = v
-
-        for speaker in remaining_speakers:
-            norm_speaker = normalize_speaker_name(speaker)
-            resolved_name = normalized_mapping.get(norm_speaker, speaker)
-            if resolved_name != speaker:
-                # LLM identified this as an alias!
-                all_possible = list(voice_config.keys()) + remaining_speakers
-                canonical_target = _resolve_to_canonical(resolved_name, all_possible, threshold=0.6)
-                if canonical_target and canonical_target != speaker:
-                    print(f"Batch LLM alias detected: {speaker} -> {canonical_target}")
-                    resolved_aliases[speaker] = canonical_target
-                else:
-                    print(f"Batch LLM mapped '{speaker}' to '{resolved_name}' but couldn't resolve canonical spelling. Treating as new.")
-
-    # Apply all resolved aliases to voice_config
-    for speaker, alias_target in resolved_aliases.items():
-        voice_entry = voice_config.get(speaker, {})
-        voice_entry.update({
-            "alias_of": alias_target,
-            "seed": voice_entry.get("seed", -1),
-        })
-        voice_config[speaker] = voice_entry
-
-    # Step 3: Generate personas for remaining truly unique speakers
-    unique_speakers = [s for s in remaining_speakers if s not in resolved_aliases]
-    print(f"Generating personas for {len(unique_speakers)} unique speakers...")
-
-    for speaker in unique_speakers:
-        lines = samples.get(speaker, [])
-        try:
-            print(f"Generating persona for: {speaker} ({len(lines)} lines samples)")
-
-            sample_text = "\n".join(lines[:8])
-            intro_ctx = narrator_context.get(speaker, [])
-            intro_blob = "\n".join(intro_ctx) if intro_ctx else "(No nearby narrator intro lines found.)"
-
-            user_prompt = persona_user.format(
-                speaker=speaker,
-                narrator_context=intro_blob,
-                sample_lines=sample_text
-            )
-
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": persona_system},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.3,
-                max_tokens=400,
-            )
-
-            text = response.choices[0].message.content.strip()
-            parsed = extract_json_object(text)
-            description = ""
-            ref_text = ""
-            if parsed:
-                description = str(parsed.get("description", "") or "").strip()
-                ref_text = str(parsed.get("ref_text", "") or "").strip()
-
-            if not description:
-                print(f"Warning: LLM did not return parseable JSON for {speaker}. Response preview:\n{text[:300]}")
-                # Fallback to compiled fallback persona
-                description, ref_text = _fallback_compiled_persona({
-                    "name": speaker,
-                    "sample_lines": lines
-                })
-
-            if not ref_text:
-                ref_text = pick_ref_text(lines)
-
-            # Generate and save voice preview
-            _save_generated_preview(root, engine, voice_config, speaker, description, ref_text)
-
-            time.sleep(0.5)
-
-        except Exception as e:
-            print(f"Unhandled error for {speaker}: {e}")
-
-    # Persist voice_config
-    try:
+    def checkpoint():
+        # CLAUDE CODE: voice_config is written first. If the process dies
+        # between the two writes, the checkpoint lags behind and that speaker
+        # is redone; it can never claim a speaker whose voice was not saved.
         _atomic_json_write(voice_config, voice_config_path)
-        print(f"Updated voice_config saved to {voice_config_path}")
-    except Exception as e:
-        print(f"Failed to save voice_config.json: {e}")
+        _atomic_json_write(progress, progress_path)
+
+    try:
+        if args.advanced:
+            failed = run_advanced_persona_generation(
+                script=script,
+                selected_speakers=selected_speakers,
+                samples=samples,
+                voice_config=voice_config,
+                client=client,
+                model_name=model_name,
+                engine=engine,
+                root=root,
+                args=args,
+                progress=progress,
+                checkpoint=checkpoint,
+                max_tokens=max_tokens,
+                system_prompt=persona_system,
+                advanced_prompt=persona_advanced,
+            )
+        else:
+            failed = run_basic_persona_generation(
+                selected_speakers, samples, narrator_context, voice_config, client,
+                model_name, engine, root, args, progress, checkpoint, max_tokens,
+                persona_system, persona_user,
+            )
+    except LLMUnavailableError as e:
+        checkpoint()
+        print(f"\nError: LLM API unavailable: {e}")
+        print("Progress is saved; run Generate Personas again to resume.")
+        sys.exit(1)
+
+    _atomic_json_write(voice_config, voice_config_path)
+    print(f"Updated voice_config saved to {voice_config_path}")
+    if failed:
+        _atomic_json_write(progress, progress_path)
+        print(f"Error: {failed} speaker(s) did not get a generated voice. "
+              f"Run Generate Personas again to retry only those.")
+        sys.exit(1)
+    if os.path.exists(progress_path):
+        os.remove(progress_path)
 
 
 if __name__ == '__main__':
