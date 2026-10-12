@@ -5,7 +5,6 @@ import re
 import argparse
 from openai import OpenAI
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
-from utils import build_llm_extra_body
 
 # Cap for single-speaker mode: entries at this size pass through
 # group_into_chunks (MAX_CHUNK_CHARS=500) as-is without further splitting.
@@ -276,12 +275,13 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
                 top_p=top_p,
                 presence_penalty=presence_penalty,
                 max_tokens=max_tokens,
-                extra_body=build_llm_extra_body(
-                    getattr(client, "base_url", ""),
-                    top_k=top_k,
-                    min_p=min_p,
-                    banned_tokens=banned_tokens,
-                ),
+                extra_body={
+                    k: v for k, v in {
+                        "top_k": top_k if top_k else None,
+                        "min_p": min_p if min_p else None,
+                        "banned_tokens": banned_tokens if banned_tokens else None,
+                    }.items() if v is not None
+                }
             )
 
             choice = response.choices[0]
@@ -418,7 +418,7 @@ def main():
         return
 
     # Load LLM config
-    config_path = os.environ.get("ALEXANDRIA_CONFIG_PATH", os.path.join(os.path.dirname(__file__), "config.json"))
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
     config = {}
     if os.path.exists(config_path):
         try:

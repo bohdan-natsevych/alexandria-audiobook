@@ -18,14 +18,17 @@ COPY app/ /alexandria/app/
 COPY default_prompts.txt review_prompts.txt persona_prompts.txt /alexandria/
 COPY builtin_lora/ /alexandria/builtin_lora/
 
-# Only reusable compute assets and disposable jobs live on the server.
-RUN mkdir -p /alexandria/lora_models \
-    /alexandria/job_workspaces \
-    /alexandria/config
+# Create directories for runtime data
+RUN mkdir -p /alexandria/scripts \
+    /alexandria/designed_voices \
+    /alexandria/clone_voices \
+    /alexandria/lora_models \
+    /alexandria/lora_datasets \
+    /alexandria/dataset_builder \
+    /alexandria/app/uploads
 
 # Bind to 0.0.0.0 inside the container
 ENV ALEXANDRIA_HOST=0.0.0.0
-ENV ALEXANDRIA_CONFIG_PATH=/alexandria/config/config.json
 EXPOSE 4200
 
 CMD ["python", "app/app.py"]

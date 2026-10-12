@@ -6,7 +6,6 @@ import argparse
 from openai import OpenAI
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
 from generate_script import clean_json_string, repair_json_array, salvage_json_entries
-from utils import build_llm_extra_body
 
 
 def _is_section_break(text):
@@ -77,7 +76,7 @@ def merge_consecutive_narrators(entries, max_merged_length=800):
 def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                  previous_tail=None, source_context=None, max_retries=2,
                  system_prompt=None, user_prompt_template=None,
-                 max_tokens=8000, temperature=0.4, top_p=0.8, top_k=0,
+                 max_tokens=8000, temperature=0.4, top_p=0.8, top_k=20,
                  min_p=0, presence_penalty=0.0, banned_tokens=None):
     """Send a batch of script entries through the LLM for review and correction."""
     sys_prompt = system_prompt or REVIEW_SYSTEM_PROMPT
@@ -112,12 +111,13 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                 top_p=top_p,
                 presence_penalty=presence_penalty,
                 max_tokens=max_tokens,
-                extra_body=build_llm_extra_body(
-                    getattr(client, "base_url", ""),
-                    top_k=top_k,
-                    min_p=min_p,
-                    banned_tokens=banned_tokens,
-                ),
+                extra_body={
+                    k: v for k, v in {
+                        "top_k": top_k,
+                        "min_p": min_p,
+                        "banned_tokens": banned_tokens if banned_tokens else None,
+                    }.items() if v is not None
+                }
             )
 
             choice = response.choices[0]
@@ -252,12 +252,10 @@ def main():
     parser.add_argument("--source", help="Path to original source text for comparison (mode 2, not yet implemented)")
     parser.add_argument("--context-window", type=int, default=0,
                         help="If > 0, review each entry with +/- N neighboring entries for better segmentation and speaker fixes")
-    parser.add_argument("--input", help="Explicit annotated-script JSON input path")
-    parser.add_argument("--output", help="Explicit reviewed-script JSON output path")
     args = parser.parse_args()
 
     # Locate annotated_script.json
-    script_path = args.input or os.path.join(os.path.dirname(__file__), "..", "annotated_script.json")
+    script_path = os.path.join(os.path.dirname(__file__), "..", "annotated_script.json")
     if not os.path.exists(script_path):
         print("Error: annotated_script.json not found. Generate a script first.")
         sys.exit(1)
@@ -278,7 +276,7 @@ def main():
             print(f"Warning: Source file not found: {args.source}")
 
     # Load config
-    config_path = os.environ.get("ALEXANDRIA_CONFIG_PATH", os.path.join(os.path.dirname(__file__), "config.json"))
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
     config = {}
     if os.path.exists(config_path):
         try:
@@ -304,7 +302,7 @@ def main():
     max_tokens = generation_config.get("max_tokens", 8000)
     temperature = generation_config.get("temperature", 0.4)
     top_p = generation_config.get("top_p", 0.8)
-    top_k = generation_config.get("top_k", 0)
+    top_k = generation_config.get("top_k", 20)
     min_p = generation_config.get("min_p", 0)
     presence_penalty = generation_config.get("presence_penalty", 0.0)
     banned_tokens = generation_config.get("banned_tokens", [])
@@ -499,13 +497,12 @@ def main():
         print("\nNarrator merging: disabled (enable in Setup > Advanced)")
 
     # Write corrected script
-    output_path = args.output or script_path
-    with open(output_path, "w", encoding="utf-8") as f:
+    with open(script_path, "w", encoding="utf-8") as f:
         json.dump(all_corrected, f, indent=2, ensure_ascii=False)
 
     # Delete chunks.json so editor regenerates
     chunks_path = os.path.join(os.path.dirname(__file__), "..", "chunks.json")
-    if not args.output and os.path.exists(chunks_path):
+    if os.path.exists(chunks_path):
         os.remove(chunks_path)
         print("Cleared old chunks.json")
 
@@ -532,7 +529,7 @@ def main():
     else:
         print(f"Fixed {total_changes} issues across {total_batches} batches.")
 
-    print(f"Output saved to: {output_path}")
+    print(f"Output saved to: {script_path}")
     print("Task review completed successfully.")
 
 
