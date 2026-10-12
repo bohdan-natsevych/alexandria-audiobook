@@ -6,6 +6,7 @@ import argparse
 from openai import OpenAI
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
 from generate_script import clean_json_string, repair_json_array, salvage_json_entries
+from utils import is_gemini_model
 
 
 def _is_section_break(text):
@@ -111,7 +112,7 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                 top_p=top_p,
                 presence_penalty=presence_penalty,
                 max_tokens=max_tokens,
-                extra_body={
+                extra_body={} if is_gemini_model(model_name) else {
                     k: v for k, v in {
                         "top_k": top_k,
                         "min_p": min_p,
@@ -276,7 +277,7 @@ def main():
             print(f"Warning: Source file not found: {args.source}")
 
     # Load config
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    config_path = os.environ.get("ALEXANDRIA_CONFIG_PATH", os.path.join(os.path.dirname(__file__), "config.json"))
     config = {}
     if os.path.exists(config_path):
         try:

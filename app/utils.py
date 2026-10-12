@@ -4,6 +4,12 @@ import time
 import tempfile
 
 
+def is_gemini_model(model_name):
+    # CLAUDE CODE: Gemini's OpenAI-compatible API rejects non-OpenAI sampling
+    # fields (top_k, min_p, banned_tokens) in extra_body, even when zero.
+    return "gemini" in str(model_name or "").lower()
+
+
 def atomic_json_write(data, target_path, max_retries=5):
     """Atomically write JSON data using a temp file and os.replace.
 
