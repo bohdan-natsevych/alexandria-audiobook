@@ -381,6 +381,8 @@ def run_process(command: List[str], task_name: str):
 
         if state.get("cancel"):
             state["logs"].append(f"Task {task_name} cancelled.")
+        elif task_name == "review" and return_code == 2:
+            state["logs"].append("Task review partially completed; original entries retained for unreviewed batches.")
         elif return_code == 0:
             state["logs"].append(f"Task {task_name} completed successfully.")
         else:

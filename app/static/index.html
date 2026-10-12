@@ -2632,7 +2632,8 @@
                             document.getElementById('download-link').href = audio.src;
                         }
                         // Refresh editor chunks when script generation or review completes
-                        if ((taskName === 'script' || taskName === 'review') && status.logs.some(l => l.includes("completed successfully"))) {
+                        if ((taskName === 'script' && status.logs.some(l => l.includes("completed successfully"))) ||
+                            (taskName === 'review' && status.logs.some(l => l === "Review output saved."))) {
                             // Clear cached chunks table so next load shows fresh data
                             const tbody = document.getElementById('chunks-table-body');
                             if (tbody) tbody.innerHTML = '';

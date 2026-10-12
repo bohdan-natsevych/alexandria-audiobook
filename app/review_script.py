@@ -5,7 +5,34 @@ import re
 import argparse
 from openai import OpenAI
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
-from generate_script import clean_json_string, repair_json_array, salvage_json_entries
+
+
+def parse_review_response(text):
+    """Require a complete, well-formed review batch instead of salvaged entries."""
+    text = re.sub(r'^\s*<(think|thinking|reflection|reasoning)>[\s\S]*?</\1>\s*', '', text)
+    start = text.find('[')
+    if start < 0:
+        return None
+    try:
+        entries, _ = json.JSONDecoder().raw_decode(text, start)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(entries, list) or not entries:
+        return None
+    if any(not isinstance(e, dict) or any(not isinstance(e.get(k), str)
+           for k in ('speaker', 'text', 'instruct')) or not e['text'].strip()
+           or not e['speaker'].strip() for e in entries):
+        return None
+    return entries
+
+
+def review_outcome(total_batches, failed_batches):
+    """CLI exit codes: 0 complete, 2 partial (saved), 1 failed (original retained)."""
+    if not total_batches or failed_batches >= total_batches:
+        return 'failed', 1
+    if failed_batches:
+        return 'partial', 2
+    return 'complete', 0
 
 
 def _is_section_break(text):
@@ -144,7 +171,10 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
             print()
 
             if finish_reason == "length":
-                print(f"  WARNING: Response was truncated (hit max_tokens={max_tokens}). Consider increasing max_tokens or reducing batch size.")
+                print(f"  WARNING: Response was truncated (hit max_tokens={max_tokens}); rejecting incomplete review.")
+                if attempt < max_retries:
+                    continue
+                return None
 
         except Exception as e:
             print(f"Error calling LLM API (attempt {attempt + 1}): {e}")
@@ -152,34 +182,10 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                 continue
             return None
 
-        # Clean and parse JSON response
-        json_text = clean_json_string(text)
-
-        if not json_text:
-            print(f"Warning: Could not find JSON array in batch {batch_num} response (attempt {attempt + 1})")
-            if attempt < max_retries:
-                print("Retrying...")
-                continue
-            print(f"Response preview: {text[:300]}...")
-            return None
-
-        entries = repair_json_array(json_text)
-
-        if entries and len(entries) > 0:
-            if attempt > 0:
-                print(f"  Succeeded on retry {attempt + 1}")
+        entries = parse_review_response(text)
+        if entries:
             return entries
-
-        print(f"Warning: Could not parse batch {batch_num} response as JSON (attempt {attempt + 1})")
-
-        if attempt < max_retries:
-            print("Retrying...")
-
-        # Last resort
-        salvaged = salvage_json_entries(json_text)
-        if salvaged:
-            print(f"Regex-salvaged {len(salvaged)} entries from malformed response")
-            return salvaged
+        print(f"Warning: Invalid or incomplete JSON in batch {batch_num} (attempt {attempt + 1})")
 
     return None
 
@@ -484,17 +490,22 @@ def main():
             all_corrected.extend(corrected)
             previous_tail = corrected[-2:] if len(corrected) >= 2 else corrected
 
+    outcome, exit_code = review_outcome(total_batches, total_stats["batches_failed"])
+    if outcome == 'failed':
+        print(f"Review failed: {total_stats['batches_failed']}/{total_batches} batches failed; original script retained.")
+        sys.exit(exit_code)
+
     # Post-processing: merge consecutive NARRATOR entries with same instruct
     merge_narrators_enabled = generation_config.get("merge_narrators", False)
     narrator_merges = 0
-    if merge_narrators_enabled:
+    if merge_narrators_enabled and outcome == "complete":
         pre_merge_count = len(all_corrected)
         all_corrected, narrator_merges = merge_consecutive_narrators(all_corrected, max_merged_length=800)
         if narrator_merges > 0:
             print(f"\nPost-processing: merged {narrator_merges} consecutive narrator entries "
                   f"({pre_merge_count} -> {len(all_corrected)} entries)")
     else:
-        print("\nNarrator merging: disabled (enable in Setup > Advanced)")
+        print("\nNarrator merging: disabled or skipped for partial review")
 
     # Write corrected script
     with open(script_path, "w", encoding="utf-8") as f:
@@ -512,7 +523,7 @@ def main():
                      total_stats["entries_removed"] + narrator_merges)
 
     print(f"\n{'='*60}")
-    print(f"Review complete: {len(entries)} -> {len(all_corrected)} entries")
+    print(f"Review {outcome}: {len(entries)} -> {len(all_corrected)} entries")
     print(f"  Text changed:    {total_stats['text_changed']}")
     print(f"  Speaker changed: {total_stats['speaker_changed']}")
     print(f"  Instruct changed:{total_stats['instruct_changed']}")
@@ -524,13 +535,16 @@ def main():
     print(f"  Total changes:   {total_changes}")
     print(f"{'='*60}")
 
-    if total_changes == 0:
+    if outcome == "partial":
+        print(f"Review partially completed: {total_stats['batches_failed']} batches remain unreviewed; their original entries were retained.")
+    elif total_changes == 0:
         print("No issues found -- script looks clean.")
     else:
         print(f"Fixed {total_changes} issues across {total_batches} batches.")
 
     print(f"Output saved to: {script_path}")
-    print("Task review completed successfully.")
+    print("Review output saved.")
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
